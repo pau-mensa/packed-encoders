@@ -211,6 +211,7 @@ def _launch_packed_short_attention(
     output = torch.empty_like(q, memory_format=torch.contiguous_format)
     n_sequences = cu_seqlens.numel() - 1
     query_blocks = triton.cdiv(int(max_seqlen), config.block_m)
+    key_extent = triton.cdiv(int(max_seqlen), config.block_n) * config.block_n
     grid = (n_sequences, q.shape[1], query_blocks)
     _packed_short_attention_fwd[grid](
         q,
@@ -222,7 +223,7 @@ def _launch_packed_short_attention(
         *k.stride(),
         *v.stride(),
         *output.stride(),
-        MAX_SEQLEN=max_seqlen,
+        MAX_SEQLEN=key_extent,
         SOFTMAX_SCALE=float(softmax_scale),
         IS_LOCAL=half_window is not None,
         HALF_WINDOW=0 if half_window is None else int(half_window),

@@ -7,6 +7,8 @@ import torch
 
 from packed_encoders import ops
 from packed_encoders._kernels.triton_packed_attention import (
+    _packed_short_attention_fwd,
+    _select_config,
     packed_short_attention,
     packed_short_attention_supported,
     select_packed_short_attention_config,
@@ -122,6 +124,27 @@ def test_no_cross_sequence_leakage():
             half_window=None, softmax_scale=0.125,
         )
     assert torch.equal(baseline[:31], changed[:31])
+
+
+@pytest.mark.parametrize("half_window", [None, 64])
+@pytest.mark.parametrize("max_seqlen", [1, 17, 33, 63, 65, 100, 127])
+def test_rounded_key_extent_is_bit_identical(max_seqlen, half_window):
+    lengths = [max_seqlen, max(1, max_seqlen // 2), max(1, max_seqlen - 3)]
+    q, k, v, cu = _inputs(lengths, seed=5)
+    config = _select_config(max_seqlen)
+    exact = torch.empty_like(q)
+    with torch.inference_mode():
+        _packed_short_attention_fwd[(len(lengths), 12, -(-max_seqlen // config.block_m))](
+            q, k, v, exact, cu, *q.stride(), *k.stride(), *v.stride(), *exact.stride(),
+            MAX_SEQLEN=max_seqlen, SOFTMAX_SCALE=0.125, IS_LOCAL=half_window is not None,
+            HALF_WINDOW=0 if half_window is None else half_window,
+            BLOCK_M=config.block_m, BLOCK_N=config.block_n, HEAD_DIM=64,
+            num_warps=config.num_warps, num_stages=config.num_stages,
+        )
+        actual = packed_short_attention(
+            q, k, v, cu, max_seqlen, half_window=half_window, softmax_scale=0.125
+        )
+    assert torch.equal(actual, exact)
 
 
 def test_capability_guard_and_static_configs():
