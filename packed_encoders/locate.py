@@ -1,7 +1,8 @@
-"""Find the ModernBERT encoder inside whatever the caller hands `pack()`.
+"""Find the backbone inside whatever the caller hands `pack()`.
 
-HF `AutoModel`, SentenceTransformers, and PyLate ColBERT all ultimately hold one
-`ModernBertModel`. This walks the known wrapper shapes to it and raises on an unknown
+HF `AutoModel`, SentenceTransformers, and PyLate ColBERT all ultimately hold one backbone
+module that a registered architecture patches (`packed_encoders.arch`). This walks the
+known wrapper shapes, asking every architecture at every node, and raises on an unknown
 container rather than guessing — a wrong guess would patch the wrong weights.
 """
 
@@ -34,9 +35,18 @@ def is_modernbert_encoder(module: object) -> bool:
 
 
 def find_encoder(target: object, *, _depth: int = 0) -> nn.Module:
-    """Return the `ModernBertModel` reachable from `target`, or raise."""
-    if is_modernbert_encoder(target):
-        return target  # type: ignore[return-value]
+    """Return the backbone module reachable from `target` that some registered
+    architecture patches, or raise."""
+    return find_backbone(target)[1]
+
+
+def find_backbone(target: object, *, _depth: int = 0):
+    """`(architecture, module)` for the backbone reachable from `target`, or raise."""
+    from packed_encoders.arch import match
+
+    arch = match(target)
+    if arch is not None:
+        return arch, target  # type: ignore[return-value]
 
     if _depth >= 4:
         raise UnsupportedTargetError(_describe(target))
@@ -45,7 +55,7 @@ def find_encoder(target: object, *, _depth: int = 0) -> nn.Module:
     first = _first_submodule(target)
     if first is not None and first is not target:
         try:
-            return find_encoder(first, _depth=_depth + 1)
+            return find_backbone(first, _depth=_depth + 1)
         except UnsupportedTargetError:
             pass
 
@@ -53,7 +63,7 @@ def find_encoder(target: object, *, _depth: int = 0) -> nn.Module:
         sub = getattr(target, attr, None)
         if isinstance(sub, nn.Module) and sub is not target:
             try:
-                return find_encoder(sub, _depth=_depth + 1)
+                return find_backbone(sub, _depth=_depth + 1)
             except UnsupportedTargetError:
                 continue
 
@@ -72,10 +82,13 @@ def _first_submodule(target: object):
 
 
 def _describe(target: object) -> str:
+    from packed_encoders.arch import registered
+
+    names = ", ".join(a.name for a in registered())
     return (
-        f"could not locate a ModernBERT encoder in {type(target).__name__!r}. "
-        "packed-encoders patches a Hugging Face ModernBertModel, a "
-        "SentenceTransformer / PyLate ColBERT wrapping one, or a task model "
-        "exposing it via .auto_model / .model. Pass the encoder directly if it "
-        "lives somewhere else."
+        f"could not locate a supported backbone in {type(target).__name__!r} "
+        f"(registered architectures: {names}). packed-encoders patches a Hugging Face "
+        "backbone, a SentenceTransformer / PyLate model wrapping one, or a task model "
+        "exposing it via .auto_model / .model. Pass the backbone directly if it lives "
+        "somewhere else."
     )

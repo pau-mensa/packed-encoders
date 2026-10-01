@@ -33,10 +33,12 @@ class PatchState:
 
 
 def get_state(target: object) -> PatchState:
-    """Return the `PatchState` for an already-patched target, or raise."""
+    """Return the patch state of an already-patched target, or raise. ModernBERT stores a
+    `PatchState`; other architectures store their own state object, each exposing at least
+    `graph_enabled` and `set_cuda_graph(enabled, config)`."""
     encoder = find_encoder(target)
     state = getattr(encoder, ATTR, None)
-    if not isinstance(state, PatchState):
+    if state is None or not (isinstance(state, PatchState) or hasattr(state, "set_cuda_graph")):
         raise PackedEncodersError(
             "this model has not been patched with packed_encoders.pack()"
         )

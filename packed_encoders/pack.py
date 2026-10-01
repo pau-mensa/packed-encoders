@@ -18,17 +18,18 @@ from packed_encoders import ops
 from packed_encoders.config import ModernBertParams
 from packed_encoders.errors import PackedEncodersError
 from packed_encoders.forward import fused_forward
-from packed_encoders.graph import GraphConfig, build_packed_runner, build_runner, graphs_globally_disabled
+from packed_encoders.graph import (
+    GraphConfig, build_packed_runner, build_runner, graphs_globally_disabled, rectangular_graph_backend,
+)
 from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
-from packed_encoders.locate import find_encoder
 from packed_encoders.state import ATTR, PatchState
-from packed_encoders.validate import validate as _validate
+from packed_encoders.validate import _validate_modernbert as _validate
 
 
 def pack(
     target: object,
     *,
-    cuda_graph: bool | GraphConfig = False,
+    cuda_graph: bool | GraphConfig | None = None,
     train_cuda_graph: bool | TrainGraphConfig = False,
     cuda_graph_seq_cutoff: int = 64,
     attention_backend: str | None = None,
@@ -73,7 +74,32 @@ def pack(
       final no-kernel fallback.
 
     `validate` runs the hard gate during pack.
+
+    Other architectures (see `packed_encoders.arch`) take the same call;
+    `cuda_graph=None` means that architecture's default (off for ModernBERT, on for Qwen3.5).
     """
+    from packed_encoders.dispatch import pack as _dispatch_pack
+
+    return _dispatch_pack(
+        target, cuda_graph=cuda_graph, train_cuda_graph=train_cuda_graph,
+        cuda_graph_seq_cutoff=cuda_graph_seq_cutoff, attention_backend=attention_backend,
+        validate=validate,
+    )
+
+
+def _pack_modernbert(
+    target: object,
+    encoder: nn.Module,
+    *,
+    cuda_graph: bool | GraphConfig | None = None,
+    train_cuda_graph: bool | TrainGraphConfig = False,
+    cuda_graph_seq_cutoff: int = 64,
+    attention_backend: str | None = None,
+    validate: bool = True,
+) -> object:
+    """The ModernBERT body of `pack()` (unchanged behavior)."""
+    if cuda_graph is None:          # ModernBERT graphs stay opt-in
+        cuda_graph = False
     if attention_backend is None:
         attention_backend = _default_backend()
     if attention_backend not in ("sdpa", "flash", "triton", "auto"):
@@ -81,7 +107,6 @@ def pack(
             "attention_backend must be 'sdpa', 'flash', 'triton', 'auto', or None, got "
             f"{attention_backend!r}"
         )
-    encoder = find_encoder(target)
 
     existing = getattr(encoder, ATTR, None)
     if existing is not None:  # idempotent — only (re)configure graphs if asked
@@ -170,12 +195,7 @@ def _enable_graphs(
         cuda_graph if isinstance(cuda_graph, GraphConfig)
         else GraphConfig(max_seq=seq_cutoff)
     )
-    graph_backend = state.attention_backend
-    if graph_backend in ("auto", "triton"):
-        # A rectangular graph cannot turn a dynamic padding mask into capture-safe
-        # cu_seqlens. Auto/Triton graph only through the already-packed runner; using
-        # dense Flash here would attend to padding, while SDPA would violate auto.
-        graph_backend = None
+    graph_backend = rectangular_graph_backend(state.attention_backend)
     state.graph_runner = (
         build_runner(encoder, state.params, config, backend=graph_backend)
         if graph_backend is not None else None
@@ -211,13 +231,17 @@ def _enable_train_graphs(
 
 def unpack(target: object) -> object:
     """Restore the original forward, reverting `pack()`."""
-    encoder = find_encoder(target)
+    from packed_encoders.dispatch import unpack as _dispatch_unpack
+
+    return _dispatch_unpack(target)
+
+
+def _unpack_modernbert(encoder: nn.Module) -> None:
     state = getattr(encoder, ATTR, None)
     if state is None:
-        return target
+        return
     encoder.forward = state.original_forward
     delattr(encoder, ATTR)
-    return target
 
 
 def _make_forward(encoder: nn.Module, state: PatchState):
