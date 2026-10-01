@@ -407,6 +407,16 @@ def build_packed_runner(
     return _PackedGraphRunner(model, params, config, backend=backend)
 
 
+def rectangular_graph_backend(backend: str) -> str | None:
+    """The attention backend a rectangular `(B, S)` graph may capture, or None for no rectangular
+    graph. It cannot turn a dynamic padding mask into capture-safe cu_seqlens, and dense Flash
+    ignores the mask: with an explicit "flash" every row shorter than its `pad_to` bucket attended
+    to pads (ModernBERT-base and gte queries 0.987 cos to fp32, 255/256 below 0.999; eager 0.99995).
+    Only SDPA honours the mask. The rest graph through the packed runner, which padded batches
+    reach via the varlen path."""
+    return None if backend in ("auto", "triton", "flash") else backend
+
+
 def build_runner(
     model: nn.Module,
     params: ModernBertParams,
@@ -439,9 +449,7 @@ def set_cuda_graph(model: object, enabled: bool, *, config: GraphConfig | None =
     if enabled and state.graph_runner is None:
         encoder = find_encoder(model)
         graph_config = config or GraphConfig()
-        backend = state.attention_backend
-        if backend in ("auto", "triton"):
-            backend = None
+        backend = rectangular_graph_backend(state.attention_backend)
         if backend is not None:
             state.graph_runner = build_runner(
                 encoder, state.params, graph_config, backend=backend,

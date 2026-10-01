@@ -21,6 +21,8 @@ sentence-transformers = ["sentence-transformers>=3.0"]
 pylate = ["pylate>=1.5"]
 fa2 = ["flash-attn"]
 fa4 = ["flash-attn-4==4.0.0b16"]
+# Qwen3.5 hybrid backbones (topk-embed-v1): the GatedDeltaNet / conv / norm kernels.
+qwen3_5 = ["flash-linear-attention>=0.5.1,<0.6"]
 
 [build-system]
 requires = ["hatchling"]

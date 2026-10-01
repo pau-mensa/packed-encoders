@@ -187,6 +187,29 @@ def test_varlen_flash_matches_hf_on_padded_batch(models, texts):
 
 
 @needs_flash
+def test_flash_cuda_graph_never_attends_to_padding():
+    """An explicit "flash" backend with graphs once replayed a rectangular graph whose
+    dense flash ignored the mask: rows shorter than their `pad_to` bucket attended to pads."""
+    import packed_encoders as pe
+    from transformers import AutoModel
+
+    tok = __import__("transformers").AutoTokenizer.from_pretrained(MODEL_ID)
+    stock = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().eval()
+    model = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().eval()
+    pe.pack(model, attention_backend="flash", validate=False,
+            cuda_graph=pe.GraphConfig(pad_to=32, max_seq=128, max_batch=8))
+    assert getattr(model, forward.ATTR).graph_runner is None
+    texts = ["short doc.", "a considerably longer document with many more tokens than the first one"]
+    enc = tok(texts, return_tensors="pt", padding="longest")
+    ids, am = enc["input_ids"].cuda(), enc["attention_mask"].cuda()
+    with torch.no_grad():
+        ref = stock(input_ids=ids, attention_mask=am).last_hidden_state
+        for _ in range(2):                                  # capture, then replay
+            out = model(input_ids=ids, attention_mask=am).last_hidden_state
+    assert _masked_cos(out, ref, am) > 0.997
+
+
+@needs_flash
 def test_5090_auto_routes_by_distribution_score(models, monkeypatch):
     """Exercise the real eager boundary on the card used for score calibration."""
     if torch.cuda.get_device_capability() != (12, 0):

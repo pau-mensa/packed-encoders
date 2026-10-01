@@ -15,7 +15,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from packed_encoders import forward
 from packed_encoders.config import ModernBertParams
 from packed_encoders.errors import ValidationError
 from packed_encoders.locate import find_encoder
@@ -42,14 +41,21 @@ class ValidationReport:
     cosine: dict[int, float] = field(default_factory=dict)
 
 
-def validate(
-    target: object,
+def validate(target: object, **kwargs):
+    """Run every gate for the target's architecture and return its report, or raise
+    `ValidationError` on a miss. ModernBERT takes `seq_lens` / `cos_threshold`."""
+    from packed_encoders.dispatch import validate as _dispatch_validate
+
+    return _dispatch_validate(target, **kwargs)
+
+
+def _validate_modernbert(
+    encoder: nn.Module,
     *,
     seq_lens: tuple[int, ...] = DEFAULT_SEQ_LENS,
     cos_threshold: float = DEFAULT_COS_THRESHOLD,
 ) -> ValidationReport:
-    """Run every gate and return a report, or raise `ValidationError` on a miss."""
-    encoder = find_encoder(target)
+    """The ModernBERT gates (unchanged behavior)."""
     params = ModernBertParams.from_hf_config(encoder.config)  # gate 1: architecture
     model_type = encoder.config.model_type
 
@@ -128,6 +134,8 @@ def _check_numerics(
     )
     vocab = int(encoder.config.vocab_size)
     generator = torch.Generator(device=device).manual_seed(0)
+
+    from packed_encoders import forward  # the fused path (CuteDSL); loaded only for ModernBERT
 
     oracle = _oracle(encoder)
     with torch.no_grad(), autocast:

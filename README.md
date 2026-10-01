@@ -21,7 +21,7 @@
 
 ## ⭐️ Overview
 
-`packed-encoders` is a high-performance execution engine for **ModernBERT** backbones. One call — `pe.pack(model)` — monkeypatches a live Hugging Face `ModernBertModel` **in place** with fused CuteDSL LayerNorm, RoPE, and GeGLU kernels, cuBLAS GEMMs, packed (padding-free) attention with per-GPU calibrated dispatch, and optional CUDA graphs.
+`packed-encoders` is a high-performance execution engine for **ModernBERT** backbones and, as its second architecture, the **Qwen3.5 hybrid** behind [topk-embed-v1](https://huggingface.co/topk-io/topk-embed-v1-xsmall). One call — `pe.pack(model)` — monkeypatches a live Hugging Face `ModernBertModel` **in place** with fused CuteDSL LayerNorm, RoPE, and GeGLU kernels, cuBLAS GEMMs, packed (padding-free) attention with per-GPU calibrated dispatch, and optional CUDA graphs.
 
 The kernels consume Hugging Face's exact weight layout, so nothing is re-packed and no wrapper class exists. `state_dict`, `save_pretrained`, `from_pretrained`, and gradient checkpointing all remain HF's own (or any other wrappers on top of HF). `pe.unpack(model)` restores the stock forward.
 
@@ -31,10 +31,14 @@ The kernels consume Hugging Face's exact weight layout, so nothing is re-packed 
 
 **Training**: **7.0x** median GradCache step time on a B200 running the Agent-ModernColBERT recipe — **4.6x** wall-clock even after paying all compile warmup — with **~37% less** per-step reserved memory and a bit-identical initial loss.
 
+**topk-embed-v1** ([xsmall](https://huggingface.co/topk-io/topk-embed-v1-xsmall), [small](https://huggingface.co/topk-io/topk-embed-v1-small)): **7.5–16x** queries/second and **1.7–4.5x** documents/second at batch 8 over the model as shipped, end to end through `encode` on L40S and H100, at mean token cosine ≥ 0.9998 to the model as shipped. The model's own loader options (bf16, FlashAttention 2, `torch.compile`) do not speed it up.
+
 Check the [benchmark section](#benchmarks) for the full tables.
 
 > [!NOTE]  
 > ModernBERT backbones at `hidden_size` divisible by 256 are supported, this includes the obvious [ModernBERT](https://huggingface.co/answerdotai/ModernBERT-base) but also: any encoder trained with the same architecture (such as [Ettin](https://huggingface.co/jhu-clsp/ettin-encoder-1b) or [mmBERT](https://huggingface.co/jhu-clsp/mmBERT-base)), late-interaction encoders trained with ModernBERT as the base (such as [ModernColBERT](https://huggingface.co/lightonai/GTE-ModernColBERT-v1)) and any finetunes that sit on top of those. The package offers a `validate()` function to check compatibility.
+>
+> Qwen3.5 hybrid backbones (GatedDeltaNet + gated attention) are the second architecture: [topk-embed-v1-xsmall and -small](https://huggingface.co/topk-io). See [docs/architectures.md](docs/architectures.md) for how architectures plug in.
 
 &nbsp;
 
@@ -74,6 +78,7 @@ Notes on the pins:
 - **torch is pinned to the 2.8 series on Python 3.10–3.13**. The prebuilt FlashAttention wheel for consumer Blackwell (sm_120) is ABI-locked to torch 2.8 and Python 3.11; on other Python versions use the in-tree Triton or SDPA backend. Python 3.14 uses torch 2.9, the first release with cp314 wheels.
 - On **sm_90 / sm_100** (H100/H200/B200) install `flash-attn-4` instead, the loader auto-selects the CuteDSL FA4 kernel there.
 - FlashAttention is optional: the packed Triton kernel ships in-tree and SDPA needs no extra dependency. On large token budgets (large batches or long documents) FA is heavily recommended.
+- **topk-embed-v1** runs on topk's own stack (torch 2.11, transformers 5.9), outside the torch pin above. Install `flash-linear-attention==0.5.1` and this package with `--no-deps` into that environment.
 - Framework extras (`--extra sentence-transformers`, `--extra pylate`) exist for convenience; the package only requires them if you actually pass those objects to `pack()`.
 
 ### Requirements
@@ -106,6 +111,16 @@ out = model(input_ids=ids, attention_mask=mask).last_hidden_state
   colbert = models.ColBERT(model_name_or_path="lightonai/GTE-ModernColBERT-v1")
 + pe.pack(colbert)
   train_loss = losses.CachedContrastive(model=colbert, ...)
+```
+
+topk-embed-v1 packs the same way, with CUDA graphs on by default:
+
+```diff
+  from sentence_transformers.multi_vector_encoder import MultiVectorEncoder
+  model = MultiVectorEncoder("topk-io/topk-embed-v1-xsmall", trust_remote_code=True, device="cuda",
+                             model_kwargs={"torch_dtype": torch.bfloat16})
++ pe.pack(model)
+  docs = model.encode(texts, task="document", batch_size=8)
 ```
 
 ## Usage
@@ -263,6 +278,19 @@ All variants start from a bit-identical initial probe loss and follow comparable
 
 > [!NOTE]
 > The B200 showcase was measured with PyTorch 2.11; the package's supported installation matrix is PyTorch 2.8–2.9. See the training protocol for the complete benchmark environment.
+
+### topk-embed-v1 (L40S and H100)
+
+End to end `model.encode` (tokenisation included), items/second, bf16 `pe.pack(model)` vs the model as shipped in the same process. Data: 256 queries (mean 21 tokens) and 512 documents (mean 332 tokens, untruncated) sampled from BEIR SciFact, sorted by length as `encode` does. topk's own stack: torch 2.11, transformers 5.9, fla 0.5.1.
+
+| Endpoint | xsmall L40S | small L40S | xsmall H100 | small H100 |
+|---|---:|---:|---:|---:|
+| Queries, batch 8 | 116 → **1,386 (12.0x)** | 112 → **842 (7.5x)** | 105 → **1,679 (16.0x)** | 95 → **1,404 (14.8x)** |
+| Documents, batch 8 | 98 → **260 (2.7x)** | 77 → **134 (1.7x)** | 94 → **424 (4.5x)** | 84 → **298 (3.5x)** |
+| Queries, batch 128 | 1,370 → **2,620 (1.9x)** | 1,048 → **1,756 (1.7x)** | 1,337 → **3,056 (2.3x)** | 1,248 → **2,746 (2.2x)** |
+| Documents, batch 128 | 161 → **238 (1.5x)** | 102 → **142 (1.4x)** | 379 → **536 (1.4x)** | 267 → **370 (1.4x)** |
+
+Mean token cosine to the model as shipped (bf16): 0.99984–0.99987. Against an fp32 forward, the per-token probe ([`benchmarks/qwen35_parity_probe.py`](benchmarks/qwen35_parity_probe.py)) finds the packed model as close as the shipped bf16 one or closer. The shipped model is host-bound at small batches (on L40S its GPU is busy ~8% of a query batch), so most of the gain is CUDA graphs; the rewritten forward (merged GEMMs, in-kernel gates, fused norms) is what makes them cheap to capture and trims document GPU time by ~17%. The model's loader options change nothing here: it already loads bf16, and its hard-wired flex attention ignores `attn_implementation`; `torch.compile` only helped documents at batch 128 (155 → 199 on L40S xsmall, below `pe.pack`'s 226 in the same run). [`benchmarks/practical_ladder.py`](benchmarks/practical_ladder.py) runs this ladder; [`benchmarks/qwen35_topk_bench.py`](benchmarks/qwen35_topk_bench.py) times the forward alone and A/Bs the engine's options.
 
 ### Reproducibility
 
