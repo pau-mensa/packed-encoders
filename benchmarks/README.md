@@ -45,9 +45,6 @@ ignored `benchmarks/results/` directory.
 | `packed_short_attention_bench.py` | Local kernel microbenchmark and parity harness, including AgentIR length profiles. |
 | `scripts/modal_packed_attention_dispatch.py` | Concurrent A100, L40S, H200, and B200 orchestration. |
 
-The obsolete `token_dispatch_bench.py` files are historical padded-dispatch
-experiments and are not callers of the current runtime policy.
-
 ## Runtime contract
 
 Inference `attention_backend="auto"` compares the specialized packed Triton kernel

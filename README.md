@@ -7,7 +7,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg" alt="Python Versions">
   <img src="https://github.com/pau-mensa/packed-encoders/actions/workflows/test.yml/badge.svg" alt="CI Status">
-  <img src="https://img.shields.io/badge/PyTorch-2.8%20%7C%202.9-orange.svg" alt="PyTorch 2.8 and 2.9">
+  <img src="https://img.shields.io/badge/PyTorch-2.11-orange.svg" alt="PyTorch 2.11">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
   <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-%23000000.svg?style=for-the-badge&logo=nvidia&logoColor=76B900" alt="CUDA"></a>
   <a href="https://github.com/NVIDIA/cutlass"><img src="https://img.shields.io/badge/CuteDSL-%23000000.svg?style=for-the-badge&logo=nvidia&logoColor=76B900" alt="CuteDSL"></a>
@@ -50,31 +50,57 @@ packed-encoders removes that waste in three layers, each usable independently:
 
 ## Installation
 
-Install from PyPI:
+Install the base runtime with CUDA 12.8:
+
 ```bash
-uv pip install packed-encoders
+uv pip install --torch-backend cu128 packed-encoders
 ```
 
-or install from source:
+From source, the lockfile selects Torch 2.11 / Triton 3.6 / CUDA 12.8:
+
 ```bash
 git clone git@github.com:pau-mensa/packed-encoders.git
 cd packed-encoders
-uv sync                 # torch 2.8 (cu128) + transformers + CuteDSL
-uv sync --extra fa2     # + compiled FlashAttention 2 (sm_120 / RTX 5090, Python 3.11)
-uv sync --extra fa4     # + CuteDSL FlashAttention 4 (sm_90 / sm_100)
+uv sync --locked --no-dev                                # base runtime
+uv sync --locked --no-dev --extra fa2                     # compiled FA2, including RTX 5090
+uv sync --locked --no-dev --extra fa2 --extra pylate       # PyLate / ModernColBERT
+uv sync --locked --no-dev --extra qwen3_5 --extra fa2      # topk-embed-v1, complete environment
+uv sync --locked --no-dev --extra fa4                     # CuteDSL FA4 on sm_90 / sm_100
 ```
 
-or straight into an existing environment:
+FA2 wheels come from [Astral's GPU index](https://wheels.astral.sh/), with explicit
+Torch ABI dependencies. The locked 2.11 wheels cover Linux x86-64/aarch64 and
+CPython 3.10–3.14, replacing the old Python-3.11-only GitHub wheel. Only FA2 is
+sourced from this index. For an existing environment or a published package,
+`uv pip` needs the index explicitly for published packages (project source settings
+are not wheel metadata):
+
 ```bash
-uv pip install "packed-encoders @ git+https://github.com/pau-mensa/packed-encoders"
+uv pip install --no-sources --torch-backend cu128 \
+  --index https://wheels.astral.sh/simple/cu128/ \
+  "packed-encoders[fa2,qwen3_5]"
+# Use -e ".[fa2,qwen3_5]" instead of the package name for an editable checkout.
 ```
 
-Notes on the pins:
+- The **package requires Torch 2.11 and Triton 3.6** on Python 3.10–3.14.
+  Users retaining Torch 2.8 should pin `packed-encoders==0.1.0`.
+- The **`qwen3_5` extra selects Torch 2.11**, Transformers 5.9, FLA, the
+  SentenceTransformers multi-vector wrapper and matching torchvision. It needs
+  no `--no-deps` workaround and can be combined with `fa2` or `fa4`.
+- **PyLate and `qwen3_5` need separate environments**: PyLate currently pins
+  SentenceTransformers 5.3, while topk uses 6.x. Request the extras individually;
+  `--all-extras` is intentionally invalid. The `sentence-transformers` extra can
+  be combined with either.
+- FlashAttention is optional: the packed Triton kernel ships in-tree and SDPA
+  needs no extra dependency. On large token budgets FA is heavily recommended.
+  The FA4 GPU paths still require validation on their target hardware; the local
+  5090 correctness suite validates the compiled FA2 path.
+- Add `--group test` for pytest or omit `--no-dev` for benchmark/development
+  dependencies. GPU tests require model downloads on their first run. For CPU CI,
+  use `uv pip install --no-sources --torch-backend cpu -e . pytest`.
 
-- **torch is pinned to the 2.8 series on Python 3.10–3.13**. The prebuilt FlashAttention wheel for consumer Blackwell (sm_120) is ABI-locked to torch 2.8 and Python 3.11; on other Python versions use the in-tree Triton or SDPA backend. Python 3.14 uses torch 2.9, the first release with cp314 wheels.
-- On **sm_90 / sm_100** (H100/H200/B200) install `flash-attn-4` instead, the loader auto-selects the CuteDSL FA4 kernel there.
-- FlashAttention is optional: the packed Triton kernel ships in-tree and SDPA needs no extra dependency. On large token budgets (large batches or long documents) FA is heavily recommended.
-- Framework extras (`--extra sentence-transformers`, `--extra pylate`) exist for convenience; the package only requires them if you actually pass those objects to `pack()`.
+For the tested environments and remaining performance checks, see
+[the Torch installation review](docs/torch-2.11-review.md).
 
 ### Requirements
 
@@ -262,7 +288,7 @@ The Agent-ModernColBERT recipe — `lightonai/GTE-ModernColBERT-v1`, GradCache (
 All variants start from a bit-identical initial probe loss and follow comparable optimization trajectories under the same data and training configuration.
 
 > [!NOTE]
-> The B200 showcase was measured with PyTorch 2.11; the package's supported installation matrix is PyTorch 2.8–2.9. See the training protocol for the complete benchmark environment.
+> The B200 showcase was measured with PyTorch 2.11, which is now also selected by the repository lock. The historical measurements have not been rerun for this installation change. See the training protocol for the complete benchmark environment.
 
 ### Reproducibility
 

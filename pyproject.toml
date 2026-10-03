@@ -6,21 +6,26 @@ readme = "README.md"
 requires-python = ">=3.10,<3.15"
 license = { file = "LICENSE" }
 dependencies = [
-    # Python 3.14 starts at torch 2.9 because torch 2.8 has no cp314 wheels.
-    "torch>=2.8,<2.9; python_version < '3.14'",
-    "torch>=2.9,<2.10; python_version >= '3.14'",
-    # CPU torch omits Triton, which the in-tree kernels import directly.
-    "triton>=3.4,<3.5; python_version < '3.14'",
-    "triton>=3.5,<3.6; python_version >= '3.14'",
-    "transformers>=4.45",
+    "torch>=2.11,<2.12",
+    # CPU Torch omits Triton; CUDA Torch selects its matching version transitively.
+    "triton>=3.6,<3.7",
+    # Bound the HF internals used by the adapters to the validated minor series.
+    "transformers>=4.45,<5.10",
     "nvidia-cutlass-dsl>=4.5.2,<4.6",
 ]
 
 [project.optional-dependencies]
 sentence-transformers = ["sentence-transformers>=3.0"]
 pylate = ["pylate>=1.5"]
-fa2 = ["flash-attn"]
+fa2 = ["flash-attn==2.8.3.post1"]
 fa4 = ["flash-attn-4==4.0.0b16"]
+# Complete topk-embed-v1 environment, including its remote wrapper's dependencies.
+qwen3_5 = [
+    "transformers>=5.9,<5.10",
+    "flash-linear-attention>=0.5.1,<0.6",
+    "sentence-transformers>=6.1,<7",
+    "torchvision>=0.26,<0.27",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -29,20 +34,31 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["packed_encoders"]
 
+[tool.uv]
+# PyLate currently pins SentenceTransformers 5.3; topk needs MultiVectorEncoder 6.x.
+conflicts = [[{ extra = "pylate" }, { extra = "qwen3_5" }]]
+
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[[tool.uv.index]]
+name = "astral-cu128"
+url = "https://wheels.astral.sh/simple/cu128/"
+explicit = true
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
-# Prebuilt FA2 for the measured torch 2.8 / cp311 / sm_120 environment.
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" }
+torchvision = { index = "pytorch-cu128" }
+# These wheels declare the Torch ABI they were built for, across Python versions.
+flash-attn = { index = "astral-cu128" }
 flash-maxsim = { git = "https://github.com/roipony/flash-maxsim", rev = "e9ff072" }
 
 [dependency-groups]
+test = ["pytest>=8.0"]
 dev = [
-    "pytest>=8.0",
+    { include-group = "test" },
     "numpy",
     "scipy",
     "datasets",

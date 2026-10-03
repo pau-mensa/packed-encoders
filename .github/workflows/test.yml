@@ -15,12 +15,15 @@ concurrency:
 
 jobs:
   test:
-    name: Python ${{ matrix.python-version }}
+    name: Python ${{ matrix.python-version }} / Torch 2.11 / ${{ matrix.profile }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        profile: [base]
+        include:
+          - {python-version: "3.12", profile: qwen3_5}
 
     steps:
       - uses: actions/checkout@v4
@@ -32,19 +35,38 @@ jobs:
           activate-environment: true
           enable-cache: true
 
-      # Hosted runners do not have GPUs. Installing the CPU wheel keeps the
-      # pure-logic tests useful while the CUDA tests use their existing skips.
+      # Resolve the package and Torch together. This tests published requirements,
+      # including the topk extra, without CUDA wheels or dependency bypasses.
       - name: Install dependencies
+        env:
+          PROFILE: ${{ matrix.profile }}
         run: |
-          if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
-            torch_requirement="torch>=2.9,<2.10"
-          else
-            torch_requirement="torch>=2.8,<2.9"
+          target="."
+          if [[ "$PROFILE" != "base" ]]; then
+            target=".[$PROFILE]"
           fi
-          uv pip install \
-            --index-url https://download.pytorch.org/whl/cpu \
-            "$torch_requirement"
-          uv pip install -e . pytest
+          uv pip install --no-sources --torch-backend cpu -e "$target" pytest
+          uv pip check
+          python -c 'import torch; assert torch.version.cuda is None, torch.__version__; print(torch.__version__)'
 
       - name: Run tests
         run: pytest tests/
+
+  lock:
+    name: Installation lock and wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv lock --check
+      - run: uv build --wheel
+      # Wheels only: never invoke nvcc to check optional dependency resolution.
+      - name: Resolve CUDA installation profiles
+        run: |
+          uv sync --locked --dry-run --no-dev --extra fa2 --extra qwen3_5
+          uv sync --locked --dry-run --no-dev --extra fa2 --extra pylate
+          uv sync --locked --dry-run --no-dev --extra fa4 --extra qwen3_5

@@ -156,3 +156,79 @@ The harness covers synthetic query/document padded and direct-packed execution,
 Flash/auto/SDPA, graph on/off and long-input fallback, plus eager/captured training.
 It isolates encoder execution; it does not establish tokenizer, retrieval, or
 end-to-end training-recipe performance. Use the showcase protocols for those claims.
+
+## Qwen3.5 / topk-embed-v1
+
+`Qwen35Hybrid` is the curated engine for the xsmall/small topk wrapper. Its
+`TopkEmbedAdapter` binds the wrapper as the patch target and `model.language_model`
+as the weight source. The existing dispatcher owns installation, validation,
+controls and teardown. Plain HF Qwen3.5 entry points are not installed by this PR.
+
+The adapter preserves topk's padded per-token vectors: projection through its head,
+output-dimension slice, optional normalization and zero padding. Grad-enabled calls
+and image inputs delegate to the saved original forward. This fallback is separate
+from the prepared engine, whose `training` capability is false.
+
+```python
+from packed_encoders.arch.qwen3_5 import Qwen35Hybrid
+
+pe.pack(model, engine=Qwen35Hybrid())  # inference graphs on by default
+packed = pe.get_engine(model)
+with torch.no_grad():
+    hidden = packed.forward_packed(pe.PackedBatch(ids, host_lengths=(7, 29, 64)))
+```
+
+The direct entry returns `[real_tokens, hidden_size]` after the backbone's final
+norm, before the topk head. It requires flat int64 IDs on the model's CUDA device
+and positive host lengths summing to the number of IDs. Sequence positions restart
+at zero. Other `PackedBatch` metadata is rejected explicitly; the engine does not
+silently discard custom positions or transfer device boundaries back to the host.
+The topk adapter still reads its wrapper's device boundaries to obtain host lengths.
+
+`Qwen35Pieces` selects 13 executable pieces: projection, RMSNorm, residual RMSNorm,
+SwiGLU, causal convolution with gate extraction, gated RMSNorm, single and paired
+Q/K RMSNorm with partial RoPE, sigmoid output gate, chunked and recurrent
+GatedDeltaNet, and packed and segmented-padded GQA attention. The reusable pieces
+live under `packed_encoders.pieces`; they take explicit weights and metadata, not
+models. A composition's `bind()` checks contracts once. The layer schedule invokes
+the selected callables in eager execution and capture; replay bypasses Python.
+
+A caller can substitute pieces with `dataclasses.replace`, as for ModernBERT.
+The engine retains the contribution's attention/GatedDeltaNet probes and fusion
+fallback policy. Pack-time validation additionally probes the selected pieces
+against independent PyTorch references and checks the complete adapter output
+against the saved model forward. `report.pieces` identifies inactive operations.
+`validate=False` skips those composition/end-to-end checks; the original kernel
+selection probes still run because they determine usable implementations.
+
+Graph configuration uses `PaddedGraphConfig`. Omitted or `None` means graphs on;
+`False` means off. On repeat pack, an explicit graph setting applies. Backend
+changes require unpacking. Training capture and ModernBERT's sequence-cutoff
+option are rejected rather than ignored. `set_train_cuda_graph(False)` is a no-op.
+
+**Graph memory.** The runner releases unused warmup allocations before capture.
+If a Qwen hidden-state or topk projection call runs out of GPU memory while a graph
+runner is held, the engine drops the runner, disables graphs, warns, and retries
+once eagerly. Cleanup runs on the weights' device. An OOM without a runner, or on
+the retry, propagates. Graphs stay disabled until explicitly re-enabled with
+`pe.set_cuda_graph(model, True, config=PaddedGraphConfig(...))`. Use smaller buckets
+or `cuda_graph=False` when graphs consume too much memory; recovery does not make
+an oversized eager workload fit. Pack-time graph validation still fails if it
+cannot complete; it does not silently skip validation.
+
+Only independent, bias-free dense projections are supported. Unmerged adapters,
+MoE and tied/aliased backbone parameter storage are rejected. Aliasing is checked
+before any mutation. Prepared projections share their merged storage with the
+original parameters; no extra full projection copies are retained. Failed
+preparation/installation and successful unpack restore independent storage and
+parameter identities. Unpack preserves optimizer updates. Storage addresses can
+change: do not retain external tensor views or CUDA graphs across pack/unpack.
+Norm scales refresh after normal in-place updates; `.data` writes, parameter
+replacement, device/dtype moves and `load_state_dict(assign=True)` require repacking.
+The engine pins launches/capture to the weights' device. Runners and FLA's temporary
+global tensor-cache setting do not support concurrent calls on the same process.
+
+Install the complete topk environment with
+`uv sync --locked --no-dev --extra qwen3_5 --extra fa2`. The lockfile uses
+Torch 2.11 / CUDA 12.8 for both engines. See [the installation review](torch-2.11-review.md)
+for installation details and the separate PyLate environment requirement.

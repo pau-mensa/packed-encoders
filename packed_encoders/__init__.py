@@ -6,6 +6,8 @@ inherits the speedup with no adapter. Curated engines (`packed_encoders.arch`):
 
 - ModernBERT / Ettin / mmBERT: CuteDSL LayerNorm, RoPE and GeGLU, cuBLAS GEMMs, packed
   attention with per-GPU dispatch; CUDA graphs optional (off by default).
+- Qwen3.5 / topk-embed-v1: hybrid FLA/Triton pieces, graphs on by default,
+  original-forward fallback for gradients and image inputs.
 
     import packed_encoders as pe
     pe.pack(model)                   # architecture defaults
@@ -27,6 +29,8 @@ from packed_encoders.errors import (
 
 # Architecture-specific public names, loaded on first access (ModernBERT's import CuteDSL).
 _LAZY = {
+    "PaddedGraphConfig": ("packed_encoders.runtime.graphs", "PaddedGraphConfig"),
+    "Qwen35Report": ("packed_encoders.arch.qwen3_5", "Qwen35Report"),
     "GraphConfig": ("packed_encoders.graph", "GraphConfig"),
     "TrainGraphConfig": ("packed_encoders.train_graph", "TrainGraphConfig"),
     "ValidationReport": ("packed_encoders.validate", "ValidationReport"),
@@ -63,6 +67,8 @@ _keep_public_functions()
 
 
 __all__ = [
+    "PaddedGraphConfig",
+    "Qwen35Report",
     "PackedBatch",
     "get_engine",
     "pack",

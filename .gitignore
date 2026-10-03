@@ -229,6 +229,3 @@ showcase/results/
 showcase/data_cache/
 showcase/output/
 data_cache/
-
-# lock files
-uv.lock

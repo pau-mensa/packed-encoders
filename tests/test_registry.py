@@ -295,3 +295,28 @@ def test_legacy_pack_entry_preserves_sparse_options(fake):
     pack(model, engine=fake)
     assert fake.prepared[-1].options == {"validate": True}
     pe.unpack(model)
+
+
+def test_topk_binding_separates_patch_target_from_weights():
+    from packed_encoders.arch.qwen3_5 import Qwen35Hybrid
+    model = nn.Module()
+    model.config = SimpleNamespace(model_type="topk_embed")
+    model.head = nn.Linear(4, 4, bias=False)
+    model.model = nn.Module()
+    model.model.language_model = nn.Module()
+    model.model.language_model.config = SimpleNamespace(model_type="qwen3_5_text")
+    engine, binding = base.select(model)
+    assert isinstance(engine, Qwen35Hybrid)
+    assert binding.patch_target is model
+    assert binding.weight_source is model.model.language_model
+    assert base.select(model.model.language_model) is None  # no plain HF adapter yet
+
+
+@pytest.mark.parametrize("options", [
+    {"cuda_graph_seq_cutoff": 64}, {"train_cuda_graph": True},
+    {"cuda_graph": "yes"}, {"attention_backend": "unknown"},
+])
+def test_qwen_rejects_options_before_loading_kernels(options):
+    from packed_encoders.arch.qwen3_5 import Qwen35Hybrid
+    with pytest.raises(PackedEncodersError):
+        Qwen35Hybrid().prepare(None, options)
