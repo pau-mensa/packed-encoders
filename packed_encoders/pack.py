@@ -14,15 +14,9 @@ import torch
 from torch import Tensor, nn
 from transformers.modeling_outputs import BaseModelOutput
 
-from packed_encoders import ops
 from packed_encoders.engine import OMITTED
 from packed_encoders.config import ModernBertParams
 from packed_encoders.errors import PackedEncodersError
-from packed_encoders.forward import fused_forward
-from packed_encoders.graph import (
-    GraphConfig, build_packed_runner, build_runner, graphs_globally_disabled, rectangular_graph_backend,
-)
-from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
 from packed_encoders.state import ATTR, PatchState
 from packed_encoders.validate import _validate_modernbert as _validate
 
@@ -142,6 +136,7 @@ def _prepare_modernbert(
 
 def _default_backend() -> str:
     """Use auto if either optimized attention implementation imports."""
+    from packed_encoders import ops
     try:
         ops._load_flash_attn()
         return "auto"
@@ -157,6 +152,7 @@ def _resolve_attention_backend(backend: str) -> str:
     """Validate explicit dependencies and collapse auto only when neither exists."""
     if backend == "sdpa":
         return backend
+    from packed_encoders import ops
     flash_error = None
     triton_error = None
     try:
@@ -191,6 +187,7 @@ def _enable_graphs(
     cuda_graph: bool | GraphConfig,
     seq_cutoff: int | None = None,
 ) -> None:
+    from packed_encoders.graph import GraphConfig, build_runner, build_packed_runner, rectangular_graph_backend
     # Explicit config wins as-is; a bare `True` gets the default config with the
     # caller's seq cutoff applied.
     config = (
@@ -214,6 +211,7 @@ def _enable_train_graphs(
     train_cuda_graph: bool | TrainGraphConfig,
     seq_cutoff: int = 64,
 ) -> None:
+    from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
     # Explicit config wins as-is; a bare `True` gets the default config with the
     # caller's seq cutoff threaded into max_seq.
     config = (
@@ -247,6 +245,8 @@ def _unpack_modernbert(encoder: nn.Module) -> None:
 
 
 def _make_forward(encoder: nn.Module, state: PatchState):
+    from packed_encoders.forward import fused_forward
+    from packed_encoders.graph import graphs_globally_disabled
     def forward(
         input_ids: Tensor | None = None,
         attention_mask: Tensor | None = None,

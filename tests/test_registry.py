@@ -246,6 +246,7 @@ def test_batch_retains_metadata_without_conversion():
 
 
 def test_failed_modernbert_preparation_leaves_no_patch(monkeypatch):
+    pytest.importorskip("cutlass")
     import importlib
     pack_module = importlib.import_module("packed_encoders.pack")
     from packed_encoders.arch.modernbert import ModernBert
@@ -270,7 +271,7 @@ def test_failed_modernbert_preparation_leaves_no_patch(monkeypatch):
     monkeypatch.setattr(pack_module, "_enable_graphs", first_graph)
     monkeypatch.setattr(pack_module, "_enable_train_graphs", fail)
     with pytest.raises(RuntimeError, match="capture failed"):
-        pe.pack(model, engine=ModernBert(), attention_backend="sdpa", validate=False,
+        pe.pack(model, engine=ModernBert(device="cuda"), attention_backend="sdpa", validate=False,
                 cuda_graph=True, train_cuda_graph=True)
     assert model.forward == original
     assert not hasattr(model, ATTR) and not hasattr(model, INSTALL_ATTR)
@@ -278,13 +279,14 @@ def test_failed_modernbert_preparation_leaves_no_patch(monkeypatch):
 
 
 def test_explicit_options_rejected_before_preparation(fake):
+    pytest.importorskip("cutlass")
     from packed_encoders.arch.modernbert import ModernBert
 
     model = Backbone()
     model.config = SimpleNamespace(model_type="modernbert")
     model.embeddings, model.layers, model.final_norm = nn.Identity(), nn.ModuleList(), nn.Identity()
     with pytest.raises(PackedEncodersError, match="cuda_graph requires"):
-        pe.pack(model, engine=ModernBert(), cuda_graph="yes", validate=False)
+        pe.pack(model, engine=ModernBert(device="cuda"), cuda_graph="yes", validate=False)
     assert not hasattr(model, ATTR)
 
 
