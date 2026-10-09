@@ -35,6 +35,10 @@ class ModernBertAdapter:
         return None
 
     def install(self, binding: ModelBinding, packed: PackedModernBert) -> None:
+        from packed_encoders.arch.modernbert_cpu import PackedModernBertCPU
+        if isinstance(packed, PackedModernBertCPU):
+            packed.install_forward()
+            return
         from packed_encoders.pack import _make_forward
         from packed_encoders.state import ATTR
 
@@ -46,10 +50,21 @@ class ModernBert:
     name = "modernbert"
     adapters = (ModernBertAdapter(),)
 
-    def __init__(self, *, pieces: ModernBertPieces | None = None):
+    def __init__(self, *, pieces: ModernBertPieces | None = None, device="auto"):
+        if device not in ("auto", "cpu", "cuda"):
+            raise ValueError("device must be 'auto', 'cpu' or 'cuda'")
         self.pieces = pieces
+        self.device = device
+
+    def _cpu(self, binding):
+        return self.device == "cpu" or (self.device == "auto" and next(binding.weight_source.parameters()).device.type == "cpu")
 
     def prepare(self, binding: ModelBinding, options: Mapping[str, Any]):
+        if self._cpu(binding):
+            if self.pieces is not None:
+                raise PackedEncodersError("CUDA operation pieces cannot be used by the CPU engine")
+            from packed_encoders.arch.modernbert_cpu import ModernBertCPU
+            return ModernBertCPU().prepare(binding, options)
         from packed_encoders.pack import _prepare_modernbert
 
         _check_options(options)
@@ -57,6 +72,11 @@ class ModernBert:
         return PackedModernBert(binding, state)
 
     def validate(self, binding: ModelBinding, **kwargs: Any) -> ValidationResult:
+        if self._cpu(binding):
+            if self.pieces is not None:
+                raise PackedEncodersError("CUDA operation pieces cannot be used by the CPU engine")
+            from packed_encoders.arch.modernbert_cpu import ModernBertCPU
+            return ModernBertCPU().validate(binding, **kwargs)
         from packed_encoders.validate import _validate_modernbert
 
         return ValidationResult(self.name, _validate_modernbert(binding.weight_source, pieces=self.pieces, **kwargs))

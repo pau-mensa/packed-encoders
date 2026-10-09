@@ -7,20 +7,19 @@ requires-python = ">=3.10,<3.15"
 license = { file = "LICENSE" }
 dependencies = [
     "torch>=2.11,<2.12",
-    # CPU Torch omits Triton; CUDA Torch selects its matching version transitively.
-    "triton>=3.6,<3.7",
     # Bound the HF internals used by the adapters to the validated minor series.
     "transformers>=4.45,<5.20",
-    "nvidia-cutlass-dsl>=4.5.2,<4.6",
 ]
 
 [project.optional-dependencies]
+cuda = ["torch>=2.11,<2.12", "triton>=3.6,<3.7", "nvidia-cutlass-dsl>=4.5.2,<4.6"]
 sentence-transformers = ["sentence-transformers>=3.0"]
 pylate = ["pylate>=1.5"]
-fa2 = ["flash-attn==2.8.3.post1"]
-fa4 = ["flash-attn-4==4.0.0b16"]
+fa2 = ["packed-encoders[cuda]", "flash-attn==2.8.3.post1"]
+fa4 = ["packed-encoders[cuda]", "flash-attn-4==4.0.0b16"]
 # Complete topk-embed-v1 environment, including its remote wrapper's dependencies.
 qwen3_5 = [
+    "packed-encoders[cuda]",
     "transformers>=5.9,<5.10",
     "flash-linear-attention>=0.5.1,<0.6",
     "sentence-transformers>=6.1,<7",
@@ -28,6 +27,7 @@ qwen3_5 = [
 ]
 # EmbeddingGemma 2 arrived in transformers 5.19; its multimodal wrapper imports timm.
 embedding_gemma2 = [
+    "packed-encoders[cuda]",
     "transformers>=5.19,<5.20",
     "timm>=1.0",
 ]
@@ -60,7 +60,7 @@ url = "https://wheels.astral.sh/simple/cu128/"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = [{ index = "pytorch-cu128", extra = "cuda", marker = "sys_platform == 'linux'" }]
 torchvision = { index = "pytorch-cu128" }
 # These wheels declare the Torch ABI they were built for, across Python versions.
 flash-attn = { index = "astral-cu128" }
