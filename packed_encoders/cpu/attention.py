@@ -63,8 +63,11 @@ class CPUAttention:
         # Private ablation switch keeps the original path available to benchmarks.
         self.fused_rope = self.library is not None
         # Measured only for short Apple-native batches. Preserve per-sequence
-        # SDPA for other platforms, long inputs and small batches.
+        # SDPA for other platforms, long inputs and small batches. Grouping
+        # trades padded keys and gather/scatter copies for fewer, larger SDPA
+        # calls, which pays off only once PyTorch spreads them across threads.
         self.grouped_global = self.library is not None
+        self.grouped_global_min_threads = 2
         self._global_plan_key = None
         self._global_plan = None
 
@@ -113,7 +116,9 @@ class CPUAttention:
         return self.output
 
     def global_(self, q, k, v, lengths):
-        if self.grouped_global and 4 <= len(lengths) and max(lengths) <= 128:
+        # Read per call: the engine follows, and never sets, PyTorch's threads.
+        if (self.grouped_global and torch.get_num_threads() >= self.grouped_global_min_threads
+                and 4 <= len(lengths) and max(lengths) <= 128):
             return self._grouped_global(q, k, v, lengths)
         return self._sdpa(q, k, v, lengths, local=False)
 
