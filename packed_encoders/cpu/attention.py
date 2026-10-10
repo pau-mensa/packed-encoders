@@ -35,6 +35,9 @@ def _library():
         rope = library.pe_rope_layout
         rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
         rope.restype = ctypes.c_int
+        geglu = library.pe_geglu
+        geglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3
+        geglu.restype = ctypes.c_int
         return library, directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
@@ -59,9 +62,10 @@ class CPUAttention:
                 warnings.warn("Apple attention compiler unavailable; using tiled CPU SDPA", stacklevel=3)
         self.backend = "native" if self.library is not None else "sdpa"
         self.scratch = self.output = None
-        self.rope_buffer = None
-        # Private ablation switch keeps the original path available to benchmarks.
+        self.rope_buffer = self.geglu_buffer = None
+        # Private ablation switches keep the original paths available to benchmarks.
         self.fused_rope = self.library is not None
+        self.fused_geglu = self.library is not None
         # Measured only for short Apple-native batches. Preserve per-sequence
         # SDPA for other platforms, long inputs and small batches. Grouping
         # trades padded keys and gather/scatter copies for fewer, larger SDPA
@@ -95,6 +99,24 @@ class CPUAttention:
             a, b = t.chunk(2, -1)
             return t * cos + torch.cat((-b, a), -1) * sin
         return rotate(q), rotate(k), v
+
+    def geglu(self, hidden):
+        """Exact-erf GELU(activation) * gate; native results borrow engine-owned storage.
+
+        Hidden is the contiguous [1, tokens, 2*width] MLP-input projection. The
+        native rational erf is not bitwise PyTorch's; both are FP32-accurate.
+        The caller holds the engine lock through consumption of the result.
+        """
+        if not self.fused_geglu:
+            a, gate = hidden.chunk(2, -1)
+            return F.gelu(a, approximate="none") * gate
+        tokens, width = hidden.shape[1], hidden.shape[2] // 2
+        if self.geglu_buffer is None or self.geglu_buffer.shape != (1, tokens, width):
+            self.geglu_buffer = torch.empty((1, tokens, width), dtype=torch.float32)
+        status = self.library.pe_geglu(hidden.data_ptr(), self.geglu_buffer.data_ptr(), tokens, width, self.threads)
+        if status:
+            raise PackedEncodersError("native CPU GeGLU failed")
+        return self.geglu_buffer
 
     def local(self, q, k, v, lengths, boundaries):
         if self.library is None:
@@ -174,5 +196,5 @@ class CPUAttention:
 
     def close(self):
         self.output = self.scratch = None
-        self.rope_buffer = None
+        self.rope_buffer = self.geglu_buffer = None
         self._global_plan_key = self._global_plan = None

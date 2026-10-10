@@ -297,8 +297,8 @@ class PackedModernBertCPU:
                        else self.attention.global_(q, k, v, lengths))
             context = context.transpose(1, 2).reshape_as(x)
             x = x + F.linear(context, layer.attn.Wo.weight, layer.attn.Wo.bias)
-            a, gate = F.linear(layer.mlp_norm(x), layer.mlp.Wi.weight, layer.mlp.Wi.bias).chunk(2, -1)
-            x = x + F.linear(F.gelu(a, approximate="none") * gate, layer.mlp.Wo.weight, layer.mlp.Wo.bias)
+            hidden = F.linear(layer.mlp_norm(x), layer.mlp.Wi.weight, layer.mlp.Wi.bias)
+            x = x + F.linear(self.attention.geglu(hidden), layer.mlp.Wo.weight, layer.mlp.Wo.bias)
         return self.model.final_norm(x)[0]
 
     def validate(self):
