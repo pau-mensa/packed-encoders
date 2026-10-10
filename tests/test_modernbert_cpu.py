@@ -133,24 +133,26 @@ def test_cpu_imports_do_not_load_cuda(model):
 @torch.no_grad()
 def test_fused_rope_layout():
     from packed_encoders.cpu.attention import CPUAttention
-    attention = CPUAttention("native", 64, 64, 2)
     rng = torch.Generator().manual_seed(17)
-    # Odd token count crosses the native 64-token work tile; distinct angles
+    # 67 tokens end in a partial native 32-token block, split across one or
+    # three workers; 7 tokens clamp the workers to one block. Distinct angles
     # exercise both halves, repeated/nonmonotonic positions and several heads.
-    for tokens in (67, 7):
-        qkv = torch.randn(1, tokens, 3 * 3 * 64, generator=rng)
-        positions = torch.randint(0, 129, (tokens,), generator=rng)
-        angles = torch.randn(129, 64, generator=rng)[positions][None, None]
-        cos, sin = angles.cos(), angles.sin()
-        attention.fused_rope = False
-        expected = attention.rope_layout(qkv, cos, sin, 3, 64)
-        attention.fused_rope = True
-        actual = attention.rope_layout(qkv, cos, sin, 3, 64)
-        for a, b in zip(actual, expected):
-            assert a.is_contiguous()
-            torch.testing.assert_close(a, b, atol=0, rtol=0)
-    attention.close()
-    assert attention.rope_buffer is None
+    for threads in (1, 3):
+        attention = CPUAttention("native", 64, 64, threads)
+        for tokens in (67, 7):
+            qkv = torch.randn(1, tokens, 3 * 3 * 64, generator=rng)
+            positions = torch.randint(0, 129, (tokens,), generator=rng)
+            angles = torch.randn(129, 64, generator=rng)[positions][None, None]
+            cos, sin = angles.cos(), angles.sin()
+            attention.fused_rope = False
+            expected = attention.rope_layout(qkv, cos, sin, 3, 64)
+            attention.fused_rope = True
+            actual = attention.rope_layout(qkv, cos, sin, 3, 64)
+            for a, b in zip(actual, expected):
+                assert a.is_contiguous()
+                torch.testing.assert_close(a, b, atol=0, rtol=0)
+        attention.close()
+        assert attention.rope_buffer is None
 
 
 @torch.no_grad()

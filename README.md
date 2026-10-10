@@ -54,10 +54,10 @@ packed-encoders removes that waste in three layers, each usable independently:
 
 ## Installation
 
-Install the base runtime with CUDA 12.8:
+Install the GPU runtime with CUDA 12.8:
 
 ```bash
-uv pip install --torch-backend cu128 packed-encoders
+uv pip install --torch-backend cu128 'packed-encoders[cuda]'
 ```
 
 From source, the lockfile selects Torch 2.11 / Triton 3.6 / CUDA 12.8:
@@ -65,7 +65,8 @@ From source, the lockfile selects Torch 2.11 / Triton 3.6 / CUDA 12.8:
 ```bash
 git clone git@github.com:pau-mensa/packed-encoders.git
 cd packed-encoders
-uv sync --locked --no-dev                                # base runtime
+uv sync --locked --no-dev --extra cuda                   # GPU runtime
+uv sync --locked --no-dev                                # CPU runtime (macOS)
 uv sync --locked --no-dev --extra fa2                     # compiled FA2, including RTX 5090
 uv sync --locked --no-dev --extra fa2 --extra pylate       # PyLate / ModernColBERT
 uv sync --locked --no-dev --extra qwen3_5 --extra fa2      # topk-embed-v1, complete environment
@@ -87,7 +88,7 @@ uv pip install --no-sources --torch-backend cu128 \
 # Use -e ".[fa2,qwen3_5]" instead of the package name for an editable checkout.
 ```
 
-- The **package requires Torch 2.11 and Triton 3.6** on Python 3.10–3.14.
+- The **package requires Torch 2.11** on Python 3.10–3.14; the `cuda` extra adds Triton 3.6 and CuteDSL.
   Users retaining Torch 2.8 should pin `packed-encoders==0.1.0`.
 - The **`qwen3_5` extra selects Torch 2.11**, Transformers 5.9, FLA, the
   SentenceTransformers multi-vector wrapper and matching torchvision. It needs
@@ -105,15 +106,17 @@ uv pip install --no-sources --torch-backend cu128 \
   5090 correctness suite validates the compiled FA2 path.
 - Add `--group test` for pytest or omit `--no-dev` for benchmark/development
   dependencies. GPU tests require model downloads on their first run. For CPU CI,
-  use `uv pip install --no-sources --torch-backend cpu -e . pytest`.
+  use `uv pip install --no-sources --torch-backend cpu -e '.[cuda]' pytest`
+  for the existing GPU dispatch tests, or omit `[cuda]` for CPU runtime tests.
 
 For the tested environments and remaining performance checks, see
 [the Torch installation review](docs/torch-2.11-review.md).
 
 ### Requirements
 
-- An NVIDIA GPU of compute capability sm_80, sm_89, sm_90, sm_100, or sm_120, with a working `ptxas` (CuteDSL JIT-compiles at runtime).
-- bf16 weights for inference, or fp32 master weights under bf16 autocast for training.
+- GPU: an NVIDIA GPU of compute capability sm_80, sm_89, sm_90, sm_100, or sm_120, with a working `ptxas` (CuteDSL JIT-compiles at runtime).
+- GPU: bf16 weights for inference, or fp32 master weights under bf16 autocast for training.
+- CPU: ModernBERT with FP32 weights. The experimental Apple Silicon backend uses Accelerate for local attention; other CPUs use tiled PyTorch SDPA. See [CPU runtime](docs/modernbert-cpu.md).
 
 ## ⚡️ Quick Start
 

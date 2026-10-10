@@ -6,6 +6,17 @@ the lower-level attention benchmarks, and the remote launchers used to run them.
 Generated JSON results and downloaded datasets stay under the ignored
 `benchmarks/results/` and `benchmarks/data_cache/` directories.
 
+## Experimental CPU work
+
+[`docs/modernbert-cpu.md`](docs/modernbert-cpu.md) describes the initial M4 Pro
+ModernBERT layer probe, optimized ONNX Runtime baselines, and the experimental
+Accelerate local-attention kernel. These are synthetic FP32 CPU experiments,
+not full-model performance claims or an installable CPU engine.
+
+[`docs/modernbert-cpu-full.md`](docs/modernbert-cpu-full.md) extends this to the
+pretrained 22-layer encoder, including ragged document/query batches, long single
+documents, full-output parity checks and memory-bounded ONNX baselines.
+
 ## Published showcases
 
 | Workload | Hardware | Protocol | Runner | Canonical config |
