@@ -30,7 +30,7 @@ def _library():
         )
         library = ctypes.CDLL(str(path))
         fn = library.pe_local_attention
-        fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 5 + [ctypes.c_void_p, ctypes.c_size_t]
+        fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p, ctypes.c_size_t]
         fn.restype = ctypes.c_int
         rope = library.pe_rope_layout
         rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
@@ -66,14 +66,9 @@ class CPUAttention:
         # Private ablation switches keep the original paths available to benchmarks.
         self.fused_rope = self.library is not None
         self.fused_geglu = self.library is not None
-        # Measured only for short Apple-native batches. Preserve per-sequence
-        # SDPA for other platforms, long inputs and small batches. Grouping
-        # trades padded keys and gather/scatter copies for fewer, larger SDPA
-        # calls, which pays off only once PyTorch spreads them across threads.
-        self.grouped_global = self.library is not None
-        self.grouped_global_min_threads = 2
-        self._global_plan_key = None
-        self._global_plan = None
+        # Native full-window attention beat per-sequence and grouped SDPA up to
+        # 128 tokens on an Apple M4 at one and eight threads; SDPA won from 256.
+        self.native_global = self.library is not None
 
     def rope_layout(self, qkv, cos, sin, heads, dim):
         """Internal FP32 conversion; native results borrow engine-owned storage.
@@ -121,61 +116,30 @@ class CPUAttention:
     def local(self, q, k, v, lengths, boundaries):
         if self.library is None:
             return self._sdpa(q, k, v, lengths, local=True)
+        return self._native(q, k, v, lengths, boundaries, self.half)
+
+    def global_(self, q, k, v, lengths, boundaries):
+        if self.native_global and max(lengths) <= 128:
+            return self._native(q, k, v, lengths, boundaries, max(lengths))
+        return self._sdpa(q, k, v, lengths, local=False)
+
+    def _native(self, q, k, v, lengths, boundaries, half):
+        # Keys within `half` positions; at least the longest length is global.
         q, k, v = (t.contiguous() for t in (q, k, v))
         _, heads, tokens, dim = q.shape
         workers = min(self.threads, heads * len(lengths))
-        needed = workers * self.tile * (self.tile + 128)
+        needed = workers * self.tile * min(self.tile + 2 * half, max(lengths))
         if self.scratch is None or self.scratch.numel() < needed:
             self.scratch = torch.empty(needed, dtype=torch.float32)
         if self.output is None or self.output.shape != q.shape:
             self.output = torch.empty_like(q)
         status = self.library.pe_local_attention(
             q.data_ptr(), k.data_ptr(), v.data_ptr(), self.output.data_ptr(), boundaries.data_ptr(),
-            tokens, heads, len(lengths), self.tile, workers, self.scratch.data_ptr(), self.scratch.numel(),
+            tokens, heads, len(lengths), self.tile, half, workers, self.scratch.data_ptr(), self.scratch.numel(),
         )
         if status:
             raise PackedEncodersError(f"native CPU attention failed: {status}")
         return self.output
-
-    def global_(self, q, k, v, lengths):
-        # Read per call: the engine follows, and never sets, PyTorch's threads.
-        if (self.grouped_global and torch.get_num_threads() >= self.grouped_global_min_threads
-                and 4 <= len(lengths) and max(lengths) <= 128):
-            return self._grouped_global(q, k, v, lengths)
-        return self._sdpa(q, k, v, lengths, local=False)
-
-    def _grouped_global(self, q, k, v, lengths):
-        # Cache only the last shape, bounded by the engine's live-token budget.
-        # Indices preserve original token order; the mask excludes padded keys.
-        key = tuple(lengths)
-        if self._global_plan_key != key:
-            offsets, offset = [], 0
-            for length in lengths:
-                offsets.append(offset)
-                offset += length
-            order = sorted(range(len(lengths)), key=lambda i: lengths[i])
-            plan = []
-            for start in range(0, len(order), 8):
-                group = order[start:start + 8]
-                width = max(lengths[i] for i in group)
-                positions = torch.arange(width)[None]
-                valid = positions < torch.tensor([lengths[i] for i in group])[:, None]
-                indices = positions + torch.tensor([offsets[i] for i in group])[:, None]
-                # Invalid keys are masked; gather a safe token for padding.
-                gather = indices.masked_fill(~valid, 0).flatten()
-                live = valid.flatten().nonzero().flatten()
-                destination = indices[valid]
-                plan.append((len(group), width, gather, valid[:, None, None], live, destination))
-            self._global_plan_key, self._global_plan = key, plan
-        out = torch.empty_like(q)
-        heads, dim = q.shape[1], q.shape[-1]
-        for batch, width, gather, mask, live, destination in self._global_plan:
-            grouped = [t.index_select(2, gather).view(heads, batch, width, dim).transpose(0, 1)
-                       for t in (q, k, v)]
-            context = F.scaled_dot_product_attention(*grouped, attn_mask=mask)
-            context = context.transpose(0, 1).reshape(1, heads, batch * width, dim)
-            out.index_copy_(2, destination, context.index_select(2, live))
-        return out
 
     def _sdpa(self, q, k, v, lengths, *, local):
         out = torch.empty_like(q)
@@ -197,4 +161,3 @@ class CPUAttention:
     def close(self):
         self.output = self.scratch = None
         self.rope_buffer = self.geglu_buffer = None
-        self._global_plan_key = self._global_plan = None
