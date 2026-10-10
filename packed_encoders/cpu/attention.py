@@ -62,6 +62,11 @@ class CPUAttention:
         self.rope_buffer = None
         # Private ablation switch keeps the original path available to benchmarks.
         self.fused_rope = self.library is not None
+        # Measured only for short Apple-native batches. Preserve per-sequence
+        # SDPA for other platforms, long inputs and small batches.
+        self.grouped_global = self.library is not None
+        self._global_plan_key = None
+        self._global_plan = None
 
     def rope_layout(self, qkv, cos, sin, heads, dim):
         """Internal FP32 conversion; native results borrow engine-owned storage.
@@ -108,7 +113,42 @@ class CPUAttention:
         return self.output
 
     def global_(self, q, k, v, lengths):
+        if self.grouped_global and 4 <= len(lengths) and max(lengths) <= 128:
+            return self._grouped_global(q, k, v, lengths)
         return self._sdpa(q, k, v, lengths, local=False)
+
+    def _grouped_global(self, q, k, v, lengths):
+        # Cache only the last shape, bounded by the engine's live-token budget.
+        # Indices preserve original token order; the mask excludes padded keys.
+        key = tuple(lengths)
+        if self._global_plan_key != key:
+            offsets, offset = [], 0
+            for length in lengths:
+                offsets.append(offset)
+                offset += length
+            order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+            plan = []
+            for start in range(0, len(order), 8):
+                group = order[start:start + 8]
+                width = max(lengths[i] for i in group)
+                positions = torch.arange(width)[None]
+                valid = positions < torch.tensor([lengths[i] for i in group])[:, None]
+                indices = positions + torch.tensor([offsets[i] for i in group])[:, None]
+                # Invalid keys are masked; gather a safe token for padding.
+                gather = indices.masked_fill(~valid, 0).flatten()
+                live = valid.flatten().nonzero().flatten()
+                destination = indices[valid]
+                plan.append((len(group), width, gather, valid[:, None, None], live, destination))
+            self._global_plan_key, self._global_plan = key, plan
+        out = torch.empty_like(q)
+        heads, dim = q.shape[1], q.shape[-1]
+        for batch, width, gather, mask, live, destination in self._global_plan:
+            grouped = [t.index_select(2, gather).view(heads, batch, width, dim).transpose(0, 1)
+                       for t in (q, k, v)]
+            context = F.scaled_dot_product_attention(*grouped, attn_mask=mask)
+            context = context.transpose(0, 1).reshape(1, heads, batch * width, dim)
+            out.index_copy_(2, destination, context.index_select(2, live))
+        return out
 
     def _sdpa(self, q, k, v, lengths, *, local):
         out = torch.empty_like(q)
@@ -130,3 +170,4 @@ class CPUAttention:
     def close(self):
         self.output = self.scratch = None
         self.rope_buffer = None
+        self._global_plan_key = self._global_plan = None

@@ -151,3 +151,39 @@ def test_fused_rope_layout():
             torch.testing.assert_close(a, b, atol=0, rtol=0)
     attention.close()
     assert attention.rope_buffer is None
+
+
+@torch.no_grad()
+def test_grouped_global_attention():
+    from packed_encoders.cpu.attention import CPUAttention
+    attention = CPUAttention("sdpa", 8, 64, 2)
+    rng = torch.Generator().manual_seed(29)
+    # Unsorted, repeated lengths, uneven final group, then a changed plan.
+    for lengths in ((17, 1, 8, 3, 8, 65, 2, 31, 9), (4, 7, 2, 128), (129, 1, 2, 3), (7,)):
+        q, k, v = [torch.randn(1, 2, sum(lengths), 8, generator=rng) for _ in range(3)]
+        attention.grouped_global = False
+        expected = attention.global_(q, k, v, lengths)
+        attention.grouped_global = True
+        actual = attention.global_(q, k, v, lengths)
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+        # Reuse the plan with new values; prior results must remain owned.
+        saved = actual.clone()
+        attention.global_(q + 1, k, v, lengths)
+        torch.testing.assert_close(actual, saved, atol=0, rtol=0)
+    attention.close()
+    assert attention._global_plan is None
+
+
+@torch.no_grad()
+def test_grouped_global_full_model(model):
+    lengths = torch.tensor([31, 1, 65, 7, 17])
+    ids = torch.arange(5 * 65).reshape(5, 65) % 61 + 3
+    mask = torch.arange(65)[None] < lengths[:, None]
+    mask[0] = mask[0].flip(0)
+    reference = model(ids, attention_mask=mask).last_hidden_state[mask]
+    pe.pack(model, attention_backend="sdpa")
+    engine = pe.get_engine(model)
+    engine.attention.grouped_global = True
+    actual = model(ids, attention_mask=mask).last_hidden_state
+    torch.testing.assert_close(actual[mask], reference, atol=2e-5, rtol=2e-5)
+    assert not actual[~mask].any()
