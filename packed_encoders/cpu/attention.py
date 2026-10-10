@@ -11,6 +11,7 @@ import tempfile
 import warnings
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 from packed_encoders.errors import PackedEncodersError
@@ -38,6 +39,9 @@ def _library():
         geglu = library.pe_geglu
         geglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3
         geglu.restype = ctypes.c_int
+        norm = library.pe_add_layer_norm
+        norm.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2 + [ctypes.c_float, ctypes.c_int]
+        norm.restype = ctypes.c_int
         return library, directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
@@ -62,10 +66,11 @@ class CPUAttention:
                 warnings.warn("Apple attention compiler unavailable; using tiled CPU SDPA", stacklevel=3)
         self.backend = "native" if self.library is not None else "sdpa"
         self.scratch = self.output = None
-        self.rope_buffer = self.geglu_buffer = None
+        self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
         # Private ablation switches keep the original paths available to benchmarks.
         self.fused_rope = self.library is not None
         self.fused_geglu = self.library is not None
+        self.fused_norm = self.library is not None
         # Native full-window attention beat per-sequence and grouped SDPA up to
         # 128 tokens on an Apple M4 at one and eight threads; SDPA won from 256.
         self.native_global = self.library is not None
@@ -112,6 +117,33 @@ class CPUAttention:
         if status:
             raise PackedEncodersError("native CPU GeGLU failed")
         return self.geglu_buffer
+
+    def add_norm(self, x, branch, norm, *, owned=False):
+        """Residual stream ``x + branch`` and ``norm`` of it, as ``(stream, normed)``.
+
+        Both inputs are contiguous [1, tokens, hidden]. The native path updates
+        ``x`` in place (bitwise PyTorch's add) and normalizes plain LayerNorms;
+        its statistics are not bitwise PyTorch's, but FP32-accurate. Unless
+        ``owned``, the normalized result borrows engine-owned storage and the
+        caller holds the engine lock through its consumption.
+        """
+        if not self.fused_norm or type(norm) is not nn.LayerNorm or norm.weight is None or "forward" in norm.__dict__:
+            x = x + branch
+            return x, norm(x)
+        shape = x.shape
+        if owned:
+            out = torch.empty(shape, dtype=torch.float32)
+        else:
+            if self.norm_buffer is None or self.norm_buffer.shape != shape:
+                self.norm_buffer = torch.empty(shape, dtype=torch.float32)
+            out = self.norm_buffer
+        status = self.library.pe_add_layer_norm(
+            x.data_ptr(), branch.data_ptr(), norm.weight.data_ptr(), None if norm.bias is None else norm.bias.data_ptr(),
+            out.data_ptr(), shape[1], shape[2], norm.eps, self.threads,
+        )
+        if status:
+            raise PackedEncodersError("native CPU residual LayerNorm failed")
+        return x, out
 
     def local(self, q, k, v, lengths, boundaries):
         if self.library is None:
@@ -160,4 +192,4 @@ class CPUAttention:
 
     def close(self):
         self.output = self.scratch = None
-        self.rope_buffer = self.geglu_buffer = None
+        self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
