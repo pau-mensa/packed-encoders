@@ -72,3 +72,48 @@ int pe_local_attention(const float *q, const float *k, const float *v,
     else dispatch_apply_f(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &context, worker);
     return 0;
 }
+
+// Split-half RoPE and token-major QKV -> head-major Q/K/V in one pass.
+// Keep multiply/add separate to match the unfused FP32 PyTorch operations.
+#pragma clang fp contract(off)
+typedef struct {
+    const float *qkv, *cos, *sin;
+    float *out;
+    int tokens, heads, workers;
+} RopeContext;
+
+static void rope_worker(void *opaque, size_t worker_id) {
+    RopeContext *c = opaque;
+    int blocks = (c->tokens + 63) / 64;
+    size_t plane = (size_t)c->heads * c->tokens * 64;
+    for (int task = (int)worker_id; task < c->heads * blocks; task += c->workers) {
+        int head = task / blocks, begin = (task % blocks) * 64;
+        int end = begin + 64 < c->tokens ? begin + 64 : c->tokens;
+        for (int token = begin; token < end; ++token) {
+            const float *src = c->qkv + ((size_t)token * 3 * c->heads + head) * 64;
+            const float *co = c->cos + (size_t)token * 64;
+            const float *si = c->sin + (size_t)token * 64;
+            float *dst = c->out + ((size_t)head * c->tokens + token) * 64;
+            for (int part = 0; part < 2; ++part) {
+                const float *in = src + part * c->heads * 64;
+                float *out = dst + part * plane;
+                for (int d = 0; d < 32; ++d) {
+                    out[d] = in[d] * co[d] + (-in[d + 32]) * si[d];
+                    out[d + 32] = in[d + 32] * co[d + 32] + in[d] * si[d + 32];
+                }
+            }
+            for (int d = 0; d < 64; ++d) dst[2 * plane + d] = src[2 * c->heads * 64 + d];
+        }
+    }
+}
+
+int pe_rope_layout(const float *qkv, const float *cos, const float *sin,
+                   float *out, int tokens, int heads, int workers) {
+    if (tokens < 1 || heads < 1 || workers < 1) return -1;
+    int tasks = heads * ((tokens + 63) / 64);
+    if (workers > tasks) workers = tasks;
+    RopeContext context = {qkv, cos, sin, out, tokens, heads, workers};
+    if (workers == 1) rope_worker(&context, 0);
+    else dispatch_apply_f(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &context, rope_worker);
+    return 0;
+}

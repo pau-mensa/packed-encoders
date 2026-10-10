@@ -62,11 +62,14 @@ def test_parity_and_owned_outputs(model, backend):
 
 
 @torch.no_grad()
-def test_direct_packed_microbatches_and_left_padding(model):
+@pytest.mark.parametrize("backend", ["sdpa", "native"])
+def test_direct_packed_microbatches_and_left_padding(model, backend):
+    if backend == "native" and (platform.system() != "Darwin" or platform.machine() != "arm64"):
+        pytest.skip("Apple Accelerate")
     ids, mask = inputs()
     mask[0] = mask[0].flip(0)
     ref = model(ids, attention_mask=mask).last_hidden_state[mask]
-    pe.pack(model, engine=pe.ModernBertCPU(max_tokens=129), attention_backend="sdpa")
+    pe.pack(model, engine=pe.ModernBertCPU(max_tokens=129), attention_backend=backend)
     out = model(ids, attention_mask=mask, return_dict=False)[0]
     torch.testing.assert_close(out[mask], ref, atol=2e-5, rtol=2e-5)
     batch = pe.PackedBatch(ids[mask], host_lengths=(7, 129),
@@ -124,3 +127,27 @@ def test_cpu_imports_do_not_load_cuda(model):
     pe.pack(model, attention_backend="sdpa")
     added = set(sys.modules) - before
     assert not any(n.split('.')[0] in {"cutlass", "triton", "fla"} for n in added)
+
+
+@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
+@torch.no_grad()
+def test_fused_rope_layout():
+    from packed_encoders.cpu.attention import CPUAttention
+    attention = CPUAttention("native", 64, 64, 2)
+    rng = torch.Generator().manual_seed(17)
+    # Odd token count crosses the native 64-token work tile; distinct angles
+    # exercise both halves, repeated/nonmonotonic positions and several heads.
+    for tokens in (67, 7):
+        qkv = torch.randn(1, tokens, 3 * 3 * 64, generator=rng)
+        positions = torch.randint(0, 129, (tokens,), generator=rng)
+        angles = torch.randn(129, 64, generator=rng)[positions][None, None]
+        cos, sin = angles.cos(), angles.sin()
+        attention.fused_rope = False
+        expected = attention.rope_layout(qkv, cos, sin, 3, 64)
+        attention.fused_rope = True
+        actual = attention.rope_layout(qkv, cos, sin, 3, 64)
+        for a, b in zip(actual, expected):
+            assert a.is_contiguous()
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+    attention.close()
+    assert attention.rope_buffer is None

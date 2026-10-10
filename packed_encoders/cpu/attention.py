@@ -32,6 +32,9 @@ def _library():
         fn = library.pe_local_attention
         fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 5 + [ctypes.c_void_p, ctypes.c_size_t]
         fn.restype = ctypes.c_int
+        rope = library.pe_rope_layout
+        rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
+        rope.restype = ctypes.c_int
         return library, directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
@@ -56,6 +59,34 @@ class CPUAttention:
                 warnings.warn("Apple attention compiler unavailable; using tiled CPU SDPA", stacklevel=3)
         self.backend = "native" if self.library is not None else "sdpa"
         self.scratch = self.output = None
+        self.rope_buffer = None
+        # Private ablation switch keeps the original path available to benchmarks.
+        self.fused_rope = self.library is not None
+
+    def rope_layout(self, qkv, cos, sin, heads, dim):
+        """Internal FP32 conversion; native results borrow engine-owned storage.
+
+        QKV is contiguous [1, tokens, 3*heads*dim]; gathered cosine/sine are
+        contiguous [1, 1, tokens, dim]. Native engine preparation ensures dim=64.
+        The caller holds the engine lock through consumption of the results.
+        """
+        tokens = qkv.shape[1]
+        if self.fused_rope:
+            shape = (3, 1, heads, tokens, dim)
+            if self.rope_buffer is None or self.rope_buffer.shape != shape:
+                self.rope_buffer = torch.empty(shape, dtype=torch.float32)
+            status = self.library.pe_rope_layout(
+                qkv.data_ptr(), cos.data_ptr(), sin.data_ptr(), self.rope_buffer.data_ptr(),
+                tokens, heads, self.threads,
+            )
+            if status:
+                raise PackedEncodersError("native CPU RoPE/layout failed")
+            return self.rope_buffer.unbind(0)
+        q, k, v = (t.transpose(1, 2) for t in qkv.view(1, tokens, 3, heads, dim).unbind(2))
+        def rotate(t):
+            a, b = t.chunk(2, -1)
+            return t * cos + torch.cat((-b, a), -1) * sin
+        return rotate(q), rotate(k), v
 
     def local(self, q, k, v, lengths, boundaries):
         if self.library is None:
@@ -98,3 +129,4 @@ class CPUAttention:
 
     def close(self):
         self.output = self.scratch = None
+        self.rope_buffer = None
