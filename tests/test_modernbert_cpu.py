@@ -108,6 +108,33 @@ def test_fallbacks_and_live_weight_updates(model):
         model(ids)
 
 
+@pytest.mark.parametrize("change", ["parameter", "storage", "submodule", "forward_hook", "pre_hook", "config"])
+@torch.no_grad()
+def test_structural_changes_require_repack(model, change):
+    ids, mask = inputs()
+    pe.pack(model, attention_backend="sdpa")
+    # Hooks on the patched root still run around the packed forward.
+    calls = []
+    model.register_forward_hook(lambda *args: calls.append(1))
+    model(ids, attention_mask=mask)
+    assert calls
+    mlp = model.layers[1].mlp
+    if change == "parameter":
+        mlp.Wo.weight = torch.nn.Parameter(mlp.Wo.weight.clone())
+    elif change == "storage":
+        mlp.Wo.weight.data = mlp.Wo.weight.data.clone()
+    elif change == "submodule":
+        mlp.Wo = torch.nn.Linear(mlp.Wo.in_features, mlp.Wo.out_features, bias=False)
+    elif change == "forward_hook":
+        model.layers[1].attn.register_forward_hook(lambda *args: None)
+    elif change == "pre_hook":
+        model.layers[1].mlp_norm.register_forward_pre_hook(lambda *args: None)
+    else:
+        model.config.local_attention = 64
+    with pytest.raises(PackedEncodersError, match="repack"):
+        model(ids, attention_mask=mask)
+
+
 def test_failed_validation_restores_model(model, monkeypatch):
     from packed_encoders.arch.modernbert_cpu import PackedModernBertCPU
     original = model.forward

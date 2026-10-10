@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
+from itertools import chain
+from operator import attrgetter, is_not
 import threading
 from types import SimpleNamespace
 
@@ -17,6 +20,10 @@ from packed_encoders.engine import Capabilities, ModelBinding, ValidationResult
 from packed_encoders.errors import PackedEncodersError, UnsupportedTargetError, ValidationError
 from packed_encoders.locate import is_modernbert_encoder
 from packed_encoders.state import ATTR
+
+_present = partial(is_not, None)
+_layout = attrgetter("dtype", "device", "shape")
+_training = attrgetter("training")
 
 
 def _forward_hooks(module):
@@ -134,7 +141,17 @@ class PackedModernBertCPU:
             for projection in (layer.attn.Wqkv, layer.attn.Wo, layer.mlp.Wi, layer.mlp.Wo):
                 if type(projection) is not nn.Linear or "forward" in projection.__dict__:
                     raise UnsupportedTargetError("CPU projections must be plain nn.Linear modules; merge adapters first")
-        self._weights = self._weight_signature()
+        # Snapshot each module's registries once. Requests compare them with
+        # C-level maps (~0.1 ms) instead of re-walking the module tree (~0.4 ms);
+        # identical children for every module from the root mean an identical tree.
+        self._modules = tuple(self.model.modules())
+        self._children = tuple(m._modules for m in self._modules)
+        self._owned = tuple(m._parameters for m in self._modules)
+        # Root hooks still run around the replaced forward; internal ones would be bypassed.
+        self._hook_dicts = tuple(chain.from_iterable(
+            (m._forward_hooks, m._forward_pre_hooks) for m in self._modules[1:]))
+        self._structure = self._structure_signature()
+        self._hook_keys, self._hooks = self._raw_hooks(), self._hook_signature()
         for param in self.model.parameters():
             if param.device.type != "cpu" or param.dtype != torch.float32 or not param.is_contiguous():
                 raise UnsupportedTargetError("CPU ModernBERT requires contiguous FP32 CPU parameters")
@@ -148,23 +165,39 @@ class PackedModernBertCPU:
             angles = torch.outer(torch.arange(self.max_position).float(), inv).repeat(1, 2)
             self.tables[kind] = (angles.cos(), angles.sin())
 
-    def _weight_signature(self):
-        return tuple((name, id(p), p.data_ptr(), p.device, p.dtype, tuple(p.shape), p.stride())
-                     for name, p in self.model.named_parameters())
+    def _structure_signature(self):
+        # Child modules and parameter objects by identity, plus parameter storage,
+        # dtype, device, shape and strides. In-place value updates stay allowed.
+        params = list(filter(_present, chain.from_iterable(map(dict.values, self._owned))))
+        return (list(map(list, map(dict.items, self._children))), list(map(list, self._owned)),
+                list(map(id, params)), list(map(torch.Tensor.data_ptr, params)),
+                list(map(_layout, params)), list(map(torch.Tensor.stride, params)))
+
+    def _raw_hooks(self):
+        return list(map(list, self._hook_dicts))
+
+    def _hook_signature(self):
+        return [(_forward_hooks(m), tuple(m._forward_pre_hooks)) for m in self._modules[1:]]
 
     def _config_signature(self):
         cfg = self.model.config
         return (cfg.hidden_size, cfg.num_attention_heads, cfg.local_attention,
                 cfg.max_position_embeddings, repr(getattr(cfg, "layer_types", None)),
                 getattr(cfg, "global_attn_every_n_layers", None), repr(getattr(cfg, "rope_parameters", None)),
-                _rope_thetas(cfg), cfg.hidden_activation,
-                tuple((name, id(m), _forward_hooks(m), tuple(m._forward_pre_hooks))
-                      for name, m in self.model.named_modules() if m is not self.model))
+                _rope_thetas(cfg), cfg.hidden_activation)
 
     def _check(self):
         if self._closed:
             raise PackedEncodersError("this CPU engine has been closed; pack the model again")
-        if self._weights != self._weight_signature() or self._configuration != self._config_signature():
+        changed = self._structure != self._structure_signature() or self._configuration != self._config_signature()
+        if not changed:
+            hooks = self._raw_hooks()
+            if hooks != self._hook_keys:
+                # Permitted output-capturing hooks may be added; any other hook fails.
+                changed = self._hooks != self._hook_signature()
+                if not changed:
+                    self._hook_keys = hooks
+        if changed:
             raise PackedEncodersError("CPU model structure/storage/device/dtype changed; unpack and repack")
 
     @property
@@ -201,7 +234,7 @@ class PackedModernBertCPU:
             extra_outputs = any(kwargs.get(key) if kwargs.get(key) is not None else getattr(cfg, key, False)
                                 for key in ("output_hidden_states", "output_attentions"))
             token_types = kwargs.get("token_type_ids")
-            fallback = (args or unsupported or extra_outputs or any(m.training for m in self.model.modules()) or torch.is_grad_enabled()
+            fallback = (args or unsupported or extra_outputs or any(map(_training, self._modules)) or torch.is_grad_enabled()
                         or torch.is_autocast_enabled("cpu") or input_ids is None
                         or (token_types is not None and bool(token_types.any())))
             if fallback:
@@ -246,7 +279,7 @@ class PackedModernBertCPU:
     def forward_packed(self, batch: PackedBatch):
         with self._lock:
             self._check()
-            if any(m.training for m in self.model.modules()) or torch.is_grad_enabled() or torch.is_autocast_enabled("cpu"):
+            if any(map(_training, self._modules)) or torch.is_grad_enabled() or torch.is_autocast_enabled("cpu"):
                 raise PackedEncodersError("CPU forward_packed requires eval(), no_grad/inference_mode, and no CPU autocast")
             self._ids(batch.input_ids, ndim=1)
             lengths = batch.host_lengths
