@@ -64,7 +64,7 @@ class CPUAdapter:
 
 
 class ModernBertCPU:
-    """CPU configuration. Thread count controls native attention workers only.
+    """CPU configuration. Thread count controls native attention/RoPE workers.
 
     Matrix operations use PyTorch/Accelerate's existing thread settings. This
     engine never changes process-global threading configuration.
@@ -291,12 +291,8 @@ class PackedModernBertCPU:
         x = self.model.embeddings(ids[None])
         for layer, kind in zip(self.layers, self.kinds):
             qkv = F.linear(layer.attn_norm(x), layer.attn.Wqkv.weight, layer.attn.Wqkv.bias)
-            q, k, v = (t.transpose(1, 2) for t in qkv.view(1, len(ids), 3, self.heads, self.dim).unbind(2))
             cos, sin = tables[kind]
-            def rotate(t):
-                a, b = t.chunk(2, -1)
-                return t * cos + torch.cat((-b, a), -1) * sin
-            q, k = rotate(q), rotate(k)
+            q, k, v = self.attention.rope_layout(qkv, cos, sin, self.heads, self.dim)
             context = (self.attention.local(q, k, v, lengths, boundaries) if kind == "sliding_attention"
                        else self.attention.global_(q, k, v, lengths))
             context = context.transpose(1, 2).reshape_as(x)
