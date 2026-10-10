@@ -1,10 +1,11 @@
-"""Full encoder CUDA graphs with host-planned, fixed prefix/suffix geometry."""
-from collections import OrderedDict
+"""Full encoder CUDA graphs with host-planned, fixed prefix/suffix geometry (runtime.shared_graphs),
+plus the fla metadata Qwen3.5's kernels need pinned across replays."""
 import weakref
 
 import torch
 
 from packed_encoders.errors import PackedEncodersError
+from packed_encoders.runtime.shared_graphs import CapturedForward, SharedGraphRunner as _SharedGraphRunner
 
 
 def retain_fla_metadata(engine, layout):
@@ -28,30 +29,6 @@ def retain_fla_metadata(engine, layout):
         return [prepare_chunk_indices(cu, 64, cu_seqlens_cpu=cpu) for cu, cpu in pairs]
 
 
-class CapturedForward:
-    """Fixed-address inputs and output; callers clone the output before the next replay."""
-
-    @torch.inference_mode()
-    def __init__(self, engine, count, forward, *, layout, warmup=2, pool=None):
-        with torch.cuda.device(engine.device):
-            self.ids = torch.zeros(count, dtype=torch.long, device=engine.device)
-            side = torch.cuda.Stream(device=engine.device)
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(max(2, warmup)):
-                    forward(self.ids)
-                self._fla_metadata = retain_fla_metadata(engine, layout)
-            torch.cuda.current_stream().wait_stream(side)
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph, pool=pool, stream=side):
-                self.output = forward(self.ids)
-
-    def replay(self, ids):
-        self.ids.copy_(ids)
-        self.graph.replay()
-        return self.output.clone()
-
-
 class SuffixGraph:
     """An explicit graph for one prepared prefix and fixed positive suffix lengths.
 
@@ -68,8 +45,8 @@ class SuffixGraph:
         with torch.cuda.device(engine.device):
             engine.sync_norms()
             self._layout = engine.prepare_prefix_layout(list(lengths), prefix)
-            self._captured = CapturedForward(engine, sum(lengths),
-                                             lambda ids: engine.prefix_core(ids, self._layout), layout=self._layout)
+            self._captured = CapturedForward(engine, sum(lengths), lambda ids: engine.prefix_core(ids, self._layout),
+                                             retain=lambda: retain_fla_metadata(engine, self._layout))
 
     def __call__(self, input_ids):
         if self._captured is None:
@@ -96,48 +73,8 @@ class SuffixGraph:
         self.close()
 
 
-class SharedGraphRunner:
-    """Bounded graphs for exact sharing plans; token values are never part of the key.
+class SharedGraphRunner(_SharedGraphRunner):
+    """`runtime.shared_graphs.SharedGraphRunner`, pinning fla's chunk indices (retain_fla_metadata)."""
 
-    Prefix discovery stays outside capture. All embedding, encoder layers, and
-    reconstruction of shared tokens execute in one replay. The pool is shared
-    across plans; calls must be serialized, like the padded graph runner.
-    """
-
-    def __init__(self, engine, config):
-        self.engine, self.config = engine, config
-        self._cache = OrderedDict()
-        self._pool = None
-
-    @property
-    def num_graphs(self):
-        return len(self._cache)
-
-    @staticmethod
-    def _key(plan):
-        # Include mappings, not just shapes: equal segment lengths can have
-        # different parents, source row order, and output reconstruction.
-        return (tuple(plan.lengths), tuple(plan.kv_lengths), plan.n_roots, plan.root_tokens,
-                *(tuple(getattr(plan, name).reshape(-1).tolist()) for name in
-                  ('src', 'out', 'rope_pos', 'conv_pos', 'parent', 'fix_rows', 'fix_taps', 'kv_idx')))
-
-    @torch.inference_mode()
-    def __call__(self, ids, plan):
-        cfg = self.config
-        if ids.numel() > cfg.max_tokens or max(plan.kv_lengths) > cfg.max_seq or cfg.max_graphs <= 0:
-            return None
-        with torch.cuda.device(self.engine.device):
-            key = self._key(plan)
-            entry = self._cache.get(key)
-            if entry is None:
-                if self._pool is None:
-                    self._pool = torch.cuda.graph_pool_handle()
-                static = self.engine.prepare_shared_layout(plan)
-                cap = CapturedForward(self.engine, ids.numel(), lambda x: self.engine.shared_core(x, static),
-                                      layout=static.layout, warmup=cfg.warmup, pool=self._pool)
-                entry = (cap, static)  # retain every metadata tensor used by the graph
-                self._cache[key] = entry
-                while len(self._cache) > cfg.max_graphs:
-                    self._cache.popitem(last=False)
-            self._cache.move_to_end(key)
-            return entry[0].replay(ids.reshape(-1))
+    def _retain(self, static):
+        return retain_fla_metadata(self.engine, static.layout)

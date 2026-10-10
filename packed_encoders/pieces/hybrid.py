@@ -17,6 +17,7 @@ GATED_RMS = Contract("gated_rms_norm", "x,z [T,H,D], [D] -> [T,H*D]", "RMSNorm(x
 QK_ROPE = Contract("rms_partial_rope", "x [T,H,D], scale [D], cos/sin [T,R] -> [T,H,D]", "RMSNorm rounded before split-half rotation of first R dimensions; fp32 tables arithmetic", autograd=False)
 QK_PAIR = Contract("rms_partial_rope_pair", "projection [T,C], offsets/strides/heads, scales [2,D], cos/sin [T,R] -> q,k", "Q/K RMSNorm and partial split-half rotation; contiguous outputs may share storage", autograd=False)
 GATE = Contract("sigmoid_gate", "x,g [T,H,D] -> [T,H*D]", "sigmoid rounded before multiplication", autograd=False)
+SHORT_CONV = Contract("gated_short_conv", "projection [T,3D] laid out B|C|x, weights [D,K], positions [T] -> [T,D]", "C * depthwise causal conv(B * x); B*x and the conv each rounded to the input dtype; positions restart per sequence", autograd=False)
 
 
 def _require(condition, message):
@@ -231,3 +232,26 @@ def gdn_piece(*, recurrent=False):
                   A_log=a_log, dt_bias=dt_bias, use_beta_sigmoid_in_kernel=True, cu_seqlens=cu, **extra)[0]
     return Piece("fla-recurrent-gdn" if recurrent else "fla-chunk-gdn", GDN, execute, ref_gdn, check_gdn,
                  rtol=0.03, atol=0.03)
+
+
+def ref_short_conv(x, w, pos):
+    d = w.shape[0]
+    b, c, u = x[:, :d], x[:, d:2 * d], x[:, 2 * d:3 * d]
+    bx = (b.float() * u.float()).to(x.dtype).float()
+    acc = torch.zeros(x.shape[0], d, device=x.device, dtype=torch.float32)
+    idx = torch.arange(x.shape[0], device=x.device)
+    for i in range(w.shape[1]):
+        lag = w.shape[1] - 1 - i
+        acc += torch.where((pos >= lag)[:, None], bx[(idx - lag).clamp_min(0)], 0) * w[:, i].float()
+    return (c.float() * acc.to(x.dtype).float()).to(x.dtype)
+
+
+def check_short_conv(x, w, pos):
+    _require(x.ndim == 2 and x.stride(-1) == 1 and w.ndim == 2 and w.is_contiguous() and
+             x.shape[1] >= 3 * w.shape[0] and pos.shape == (x.shape[0],),
+             "short conv requires a [T,3D] B|C|x projection, contiguous [D,K] taps and one position per token")
+
+
+def short_conv_piece():
+    from packed_encoders._kernels.short_conv import short_conv
+    return Piece("triton-gated-short-conv", SHORT_CONV, short_conv, ref_short_conv, check_short_conv)

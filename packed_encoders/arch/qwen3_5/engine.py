@@ -43,7 +43,10 @@ from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gat
 
 from packed_encoders.arch.qwen3_5.kernels import conv_split, gated_rms_norm, qk_norm_rope, qk_norm_rope_pair, sigmoid_gate
 from packed_encoders.arch.qwen3_5.execution import ORDINARY, PREFIX
-from packed_encoders.arch.qwen3_5.sharing import SharedPlan, plan_shared_prefixes
+from packed_encoders.arch.weights import (
+    require_independent_parameters, require_plain as _require_plain, share_rows as _share_rows, unshare_rows,
+)
+from packed_encoders.runtime.sharing import SharedPlan, plan_shared_prefixes
 from packed_encoders.errors import UnsupportedTargetError, ValidationError
 from packed_encoders.pieces.hybrid import reference_delta as _gdn_reference
 from packed_encoders.runtime.attention import AttentionChoice, select_attention
@@ -65,53 +68,8 @@ def fla_tensor_cache():
         fla.utils.FLA_DISABLE_TENSOR_CACHE = prev
 
 
-def _require_plain(linears: Sequence[nn.Module]) -> None:
-    """The engine reads `.weight` and nothing else. A peft tuner layer exposes its *base* weight
-    there (BaseTunerLayer.weight), so an unmerged adapter would be silently dropped; refuse it,
-    and a bias, which would be dropped too."""
-    for lin in linears:
-        if hasattr(lin, "lora_A") or hasattr(lin, "base_layer") or getattr(lin, "bias", None) is not None:
-            raise UnsupportedTargetError(
-                f"{type(lin).__name__} carries a bias or an unmerged LoRA adapter; merge adapters "
-                "first (peft: model = model.merge_and_unload()) — packing reads plain dense weights"
-            )
-
-
-def _share_rows(linears: Sequence[nn.Linear], registry: list[nn.Linear]) -> Tensor:
-    """Concatenate the weights row-wise and re-point every parameter at its slice of the
-    result, so the merged GEMM weight and the HF parameters are one storage. Re-pointed
-    layers are appended to `registry` for `unshare_rows`."""
-    _require_plain(linears)
-    merged = torch.cat([lin.weight.detach() for lin in linears], 0)
-    off = 0
-    for lin in linears:
-        n = lin.weight.shape[0]
-        lin.weight.data = merged[off:off + n]
-        registry.append(lin)
-        off += n
-    return merged
-
-
-def unshare_rows(registry: list[nn.Linear], *, rollback: bool = False) -> None:
-    """Restore independent parameter storage, retaining live values and identities.
-
-    Shared source parameters are rejected before preparation. Restoring independent
-    storage therefore restores the accepted aliasing contract too. Addresses can change;
-    callers must not retain pre-pack tensor views or external graphs across pack/unpack.
-    """
-    for lin in registry:
-        lin.weight.data = lin.weight.data.clone()
-    registry.clear()
-
-
 def _require_independent_parameters(model: nn.Module) -> None:
-    """Reject aliasing before any re-pointing; merged projections must be independent."""
-    seen = set()
-    for name, param in model.named_parameters(remove_duplicate=False):
-        key = (param.device, param.untyped_storage().data_ptr())
-        if key in seen:
-            raise UnsupportedTargetError(f"Qwen3.5 requires independent parameter storage; {name} is tied or aliased")
-        seen.add(key)
+    require_independent_parameters(model, "Qwen3.5")
 
 
 GDN_PROBE_TOLERANCE = 3e-2     # max |kernel - fp32 recurrence|, relative to the recurrence's max |output|

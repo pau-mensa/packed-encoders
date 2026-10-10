@@ -13,7 +13,7 @@ The first candidate that passes wins. `sdpa` always passes, so selection never f
 only gets slower. Rejections are recorded with their reason for `validate()` reports.
 
 Causal engines also get a *prefixed* form: each query segment is the tail of a longer key
-segment (rows continuing a shared prefix, see arch.qwen3_5.sharing), so the causal mask is
+segment (rows continuing a shared prefix, see runtime.sharing), so the causal mask is
 aligned to the end. It is probed the same way; when the winner's fails, SDPA serves it.
 """
 

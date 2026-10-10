@@ -33,6 +33,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from packed_encoders.arch.weights import validation_ids_below as _validation_ids_below
 from packed_encoders.errors import PackedEncodersError, ValidationError
 from packed_encoders.runtime.graphs import PaddedGraphConfig, PaddedGraphRunner, graphs_globally_disabled
 from packed_encoders.runtime.staging import PinnedStager
@@ -45,18 +46,6 @@ MIN_CAPABILITY = (8, 0)   # bf16 tensor cores; fla's Triton kernels target sm_80
 EAGER_MEAN_COS, EAGER_MIN_COS = 0.999, 0.98
 GRAPH_MEAN_COS, GRAPH_MIN_COS = 0.9995, 0.99
 _BACKENDS = {None: None, "auto": None, "flash": ("flash4", "flash2", "torch_varlen"), "sdpa": ("sdpa",)}
-
-
-def _validation_ids_below(cfg) -> int:
-    """Validation's random token ids come from the regular vocabulary, below this. Qwen tokenizers put their
-    special tokens after it, then the embedding's padding rows: ids no tokenizer emits, rows training never
-    reached. One of those in a row can take the model's own bf16 forward far from fp32 (Qwen3.5-4B on an
-    L40S: cosine 0.87 on that token, the engine 0.97), so a check there measures the reference, not the
-    engine. The lowest special token the config names in the embedding's upper half starts that tail."""
-    rows = cfg.vocab_size
-    named = [i for k, v in vars(cfg).items() if k.endswith("_token_id")
-             for i in (v if isinstance(v, (list, tuple)) else (v,)) if isinstance(i, int) and rows // 2 <= i < rows]
-    return min(named, default=rows)
 
 
 def _topk_text_model(module: nn.Module) -> nn.Module | None:

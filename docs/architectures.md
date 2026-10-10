@@ -329,8 +329,112 @@ Measure a model before opting in:
 python benchmarks/qwen35_shared_prefix_bench.py --model Qwen/Qwen3.5-0.8B --out shared.json
 ```
 
-Batches with shared prefixes run eagerly, without graphs. With sharing on, planning reads the
+With graphs on, batches with shared prefixes replay one CUDA graph per plan
+(`runtime.shared_graphs`); the measurements above ran the shared pass eagerly. With sharing on, planning reads the
 batch's leading tokens once per call, when at least two rows are longer than
 `min_shared_prefix`. `validate()` checks the shared pass against the model's own forward even
 while sharing is off and reports `shared_cos_mean` / `shared_cos_min`;
 `shared_prefix_rejected` says why a model can't share.
+
+## LFM2
+
+`Lfm2Hybrid` packs LFM2 text backbones: gated short convolutions (`C * conv(B * x)`, a
+3-tap depthwise causal conv) interleaved with GQA softmax attention with per-head Q/K
+RMSNorm and full RoPE. `HFLfm2Adapter` binds transformers' `Lfm2Model` as both patch
+target and weight source, whether it is handed over directly, under a task head
+(`Lfm2ForCausalLM.model`), or as the `.language_model` of a multimodal wrapper such as
+`Lfm2VlModel`. The patched forward keeps HF's contract: `input_ids` *or* `inputs_embeds`
+plus `attention_mask`, right or left padded, in; `last_hidden_state` out, pads as zeros.
+
+```python
+model = Lfm2VlForConditionalGeneration.from_pretrained(model_id, dtype=torch.bfloat16).to("cuda")
+pe.pack(model)                                   # packs model.model.language_model
+with torch.no_grad():
+    out = model.model(**batch, use_cache=False)  # use_cache=False, or set it in the config
+```
+
+A multimodal wrapper merges its image features into `inputs_embeds` before calling the
+backbone, so image batches run packed too. Token-id batches replay CUDA graphs when they fit
+a bucket; embedding batches run the eager packed engine; batches whose rows share a prefix run
+it once when the caller opts in (see **Shared prefixes** below). Calls the engine can't serve run
+the original forward unchanged: gradients, a KV cache (`use_cache` resolves to True by
+default in LFM2 configs), explicit `position_ids`, extra outputs and masks with holes.
+
+`Lfm2Pieces` selects 9 pieces: projection, RMSNorm, residual RMSNorm, SwiGLU, the gated
+short conv (one Triton launch reading the in-projection in place, positions restarting per
+sequence), paired Q/K RMSNorm + RoPE, and packed, segmented-padded and prefixed attention. q|k|v and
+w1|w3 are merged GEMMs sharing the HF parameters' storage, as for Qwen3.5. LFM2's norms
+scale by `weight` (no `1 +`); fp32 copies refresh after in-place updates (`sync_norms`).
+At build time the fused Q/K kernel and the packed conv are checked against the model's own
+modules; pack-time validation compares token ids (eager and graphed) and input embeddings
+with the model's forward. Only causal backbones are supported: a bidirectional LFM2 also
+changes the convolution (centred taps), not just the mask. Conv biases, unmerged adapters
+and aliased parameters are rejected before any mutation.
+
+Pack-time validation holds eager, input-embedding and graphed output alike to the model's own
+forward (per-token cosine mean ≥ 0.999, min ≥ 0.98). Graphs are not compared with eager: a
+bucket's padded GEMMs round differently, and over a deep stack two bf16 paths drift apart more
+than either drifts from fp32. On d1-3B (30 layers, L40S), against an fp32 forward: stock bf16
+0.99826 mean, eager 0.99868, graphed 0.99870 (bitwise the padded layout run eagerly), graphed vs
+eager 0.99936.
+
+Measured on LiquidAI/d1-3B's backbone (an LFM2-VL checkpoint, 2048 hidden, 30 layers, 10 of them
+attention), L40S, torch 2.11, torch varlen attention (no flash-attn), random rows, ms per batch:
+
+| Batch | Padding | Stock HF (sdpa, padded) | Packed, eager | Packed, graphs | Speedup |
+|---|---|---|---|---|---|
+| 1 × 128 tokens | 0% | 21.4 | 19.8 | 9.7 | 2.21x |
+| 8 rows, 32–512 tokens | 47% | 121.0 | 57.9 | 74.3 | 2.09x |
+| 32 rows, 32–512 tokens | 39% | 592.4 | 282.6 | 309.0 | 2.10x |
+| 8 × 1,024 tokens | 0% | 266.7 | 230.9 | 230.7 | 1.16x |
+
+```bash
+python benchmarks/hf_forward_bench.py --model LiquidAI/d1-3B --out forward.json
+```
+
+The benchmark takes any model `pack()` supports. Per-token cosine with stock HF: 0.9991 to
+0.9995 mean. The wrapper path (`inputs_embeds`, eager) times as eager. Packing pays where it
+removes padding; on equal-length rows this 3B model is GEMM bound, and stock HF already runs
+those GEMMs about as fast. Single rows are host bound and vary with the machine: on another
+L40S host, 1 × 128 took 12.3 ms stock and 9.5 ms graphed (1.30x). As on Qwen3.5, a graph runs
+every row padded to its bucket: graphs win single-row calls and lose mixed-length multi-row
+batches.
+
+**Shared prefixes.** As for Qwen3.5, rows whose first `min_shared_prefix` tokens agree run
+their longest common prefix once (opt in; 0, the default, runs every row in full). LFM2 has no
+recurrent state to resume, so the whole forest of prefixes and continuations is one pass:
+a continuation's first two tokens recompute their conv taps over the prefix's last tokens, and
+its attention reads the prefix's keys and values with an end-aligned causal mask (the prefixed
+varlen kernel, probed at pack time). Through a multimodal wrapper, rows are matched on their
+input embeddings instead of token ids: a 64-bit hash of each row's bits groups them, and a plan
+is used only if every row it pairs is bit-identical, so a shared image prefix is shared too.
+
+```python
+pe.pack(model)
+pe.get_engine(model).min_shared_prefix = 64
+rows = [state + question for question in questions]       # one state, several questions
+batch = tokenizer(rows, padding=True, return_tensors="pt").to("cuda")
+with torch.no_grad():
+    hidden = model.model(**batch, use_cache=False).last_hidden_state
+```
+
+d1-3B, L40S, one state and several 16–40-token questions (the same benchmark run), ms per batch,
+speedup over stock HF in parentheses:
+
+| State, questions | Tokens not recomputed | Stock HF | Packed, every row in full | Shared, eager | Shared, graphs | Shared, via the VL wrapper |
+|---|---|---|---|---|---|---|
+| 256 tokens, 8 | 80% | 77.4 | 64.6 | 28.6 (2.7x) | 17.1 (4.5x) | 29.1 |
+| 1,024 tokens, 8 | 85% | 285.1 | 238.4 | 39.6 (7.2x) | 38.3 (7.4x) | 40.2 |
+| 2,048 tokens, 16 | 93% | 1,290.1 | 1,002.7 | 81.8 (15.8x) | 81.5 (15.8x) | 85.8 |
+
+As for Qwen3.5, token-id batches replay the shared pass as one CUDA graph per plan
+(`runtime.shared_graphs`), matching the eager pass: it pays where launch overhead matters (a
+short state) and is a wash once the batch is compute bound. A plan is captured the
+first time it is seen (two warmup passes, then the capture) and keyed on its exact row lengths
+and groups, so graphs help when plans recur; traffic whose plans rarely repeat is better
+served eagerly. Input embeddings (the VL wrapper) run the shared pass eagerly.
+
+Per-token cosine with stock HF over every token: 0.9990 to 0.9997 mean, the same as rows run
+in full. With sharing on, a batch that shares nothing costs only its planning. `validate()` checks the shared pass (token ids and embeddings) against the
+model's own forward even while sharing is off, reporting `shared_cos_mean` / `shared_cos_min`
+and, on a miss, `shared_prefix_rejected`.
