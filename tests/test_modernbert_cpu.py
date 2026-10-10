@@ -157,6 +157,24 @@ def test_fused_rope_layout():
 
 @pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
 @torch.no_grad()
+def test_native_local_attention():
+    from packed_encoders.cpu.attention import CPUAttention
+    rng = torch.Generator().manual_seed(31)
+    # Lengths straddle the +/-64 window (65/66), the 64-row tile and several
+    # tiles with clipped windows on both sides, packed with short sequences.
+    lengths = (7, 65, 66, 1, 130, 200)
+    q, k, v = [torch.randn(1, 3, sum(lengths), 64, generator=rng) * 2 for _ in range(3)]
+    boundaries = torch.tensor(lengths, dtype=torch.int32)
+    for threads in (1, 3):
+        attention = CPUAttention("native", 64, 64, threads)
+        expected = attention._sdpa(q, k, v, lengths, local=True)
+        actual = attention.local(q, k, v, lengths, boundaries)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        attention.close()
+
+
+@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
+@torch.no_grad()
 def test_fused_geglu():
     from packed_encoders.cpu.attention import CPUAttention
     rng = torch.Generator().manual_seed(23)
@@ -181,61 +199,34 @@ def test_fused_geglu():
         assert attention.geglu_buffer is None
 
 
+@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
 @torch.no_grad()
-def test_grouped_global_attention():
+def test_native_global_attention():
     from packed_encoders.cpu.attention import CPUAttention
-    attention = CPUAttention("sdpa", 8, 64, 2)
-    attention.grouped_global_min_threads = 1  # exercise grouping at any thread count
     rng = torch.Generator().manual_seed(29)
-    # Unsorted, repeated lengths, uneven final group, then a changed plan.
-    for lengths in ((17, 1, 8, 3, 8, 65, 2, 31, 9), (4, 7, 2, 128), (129, 1, 2, 3), (7,)):
-        q, k, v = [torch.randn(1, 2, sum(lengths), 8, generator=rng) for _ in range(3)]
-        attention.grouped_global = False
-        expected = attention.global_(q, k, v, lengths)
-        attention.grouped_global = True
-        actual = attention.global_(q, k, v, lengths)
-        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
-        # Reuse the plan with new values; prior results must remain owned.
-        saved = actual.clone()
-        attention.global_(q + 1, k, v, lengths)
-        torch.testing.assert_close(actual, saved, atol=0, rtol=0)
-    attention.close()
-    assert attention._global_plan is None
+    # Batches up to 128 tokens (crossing the 64-row tile) use the native kernel
+    # with a full window; any longer sequence keeps per-sequence SDPA.
+    for lengths in ((17, 1, 8, 3, 65, 2, 128), (7,), (129, 1, 2)):
+        q, k, v = [torch.randn(1, 3, sum(lengths), 64, generator=rng) * 2 for _ in range(3)]
+        boundaries = torch.tensor(lengths, dtype=torch.int32)
+        for threads in (1, 3):
+            attention = CPUAttention("native", 64, 64, threads)
+            expected = attention._sdpa(q, k, v, lengths, local=False)
+            actual = attention.global_(q, k, v, lengths, boundaries)
+            assert (actual is attention.output) == (max(lengths) <= 128)
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+            attention.close()
 
 
+@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
 @torch.no_grad()
-def test_grouped_global_full_model(model):
+def test_native_global_full_model(model):
     lengths = torch.tensor([31, 1, 65, 7, 17])
     ids = torch.arange(5 * 65).reshape(5, 65) % 61 + 3
     mask = torch.arange(65)[None] < lengths[:, None]
     mask[0] = mask[0].flip(0)
     reference = model(ids, attention_mask=mask).last_hidden_state[mask]
-    pe.pack(model, attention_backend="sdpa")
-    engine = pe.get_engine(model)
-    engine.attention.grouped_global = True
-    engine.attention.grouped_global_min_threads = 1
+    pe.pack(model, attention_backend="native")
     actual = model(ids, attention_mask=mask).last_hidden_state
-    assert engine.attention._global_plan is not None
     torch.testing.assert_close(actual[mask], reference, atol=2e-5, rtol=2e-5)
     assert not actual[~mask].any()
-
-
-@torch.no_grad()
-def test_grouped_global_follows_thread_count():
-    from packed_encoders.cpu.attention import CPUAttention
-    attention = CPUAttention("sdpa", 8, 64, 2)
-    attention.grouped_global = True
-    lengths = (5, 3, 8, 2)
-    q, k, v = [torch.randn(1, 2, sum(lengths), 8) for _ in range(3)]
-    threads = torch.get_num_threads()
-    try:
-        # Read on every call; one PyTorch thread keeps per-sequence SDPA.
-        torch.set_num_threads(1)
-        expected = attention.global_(q, k, v, lengths)
-        assert attention._global_plan is None
-        torch.set_num_threads(attention.grouped_global_min_threads)
-        actual = attention.global_(q, k, v, lengths)
-        assert attention._global_plan is not None
-        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
-    finally:
-        torch.set_num_threads(threads)

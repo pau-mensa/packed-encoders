@@ -294,7 +294,7 @@ class PackedModernBertCPU:
             cos, sin = tables[kind]
             q, k, v = self.attention.rope_layout(qkv, cos, sin, self.heads, self.dim)
             context = (self.attention.local(q, k, v, lengths, boundaries) if kind == "sliding_attention"
-                       else self.attention.global_(q, k, v, lengths))
+                       else self.attention.global_(q, k, v, lengths, boundaries))
             context = context.transpose(1, 2).reshape_as(x)
             x = x + F.linear(context, layer.attn.Wo.weight, layer.attn.Wo.bias)
             hidden = F.linear(layer.mlp_norm(x), layer.mlp.Wi.weight, layer.mlp.Wi.bias)
