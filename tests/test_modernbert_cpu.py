@@ -159,6 +159,7 @@ def test_fused_rope_layout():
 def test_grouped_global_attention():
     from packed_encoders.cpu.attention import CPUAttention
     attention = CPUAttention("sdpa", 8, 64, 2)
+    attention.grouped_global_min_threads = 1  # exercise grouping at any thread count
     rng = torch.Generator().manual_seed(29)
     # Unsorted, repeated lengths, uneven final group, then a changed plan.
     for lengths in ((17, 1, 8, 3, 8, 65, 2, 31, 9), (4, 7, 2, 128), (129, 1, 2, 3), (7,)):
@@ -186,6 +187,29 @@ def test_grouped_global_full_model(model):
     pe.pack(model, attention_backend="sdpa")
     engine = pe.get_engine(model)
     engine.attention.grouped_global = True
+    engine.attention.grouped_global_min_threads = 1
     actual = model(ids, attention_mask=mask).last_hidden_state
+    assert engine.attention._global_plan is not None
     torch.testing.assert_close(actual[mask], reference, atol=2e-5, rtol=2e-5)
     assert not actual[~mask].any()
+
+
+@torch.no_grad()
+def test_grouped_global_follows_thread_count():
+    from packed_encoders.cpu.attention import CPUAttention
+    attention = CPUAttention("sdpa", 8, 64, 2)
+    attention.grouped_global = True
+    lengths = (5, 3, 8, 2)
+    q, k, v = [torch.randn(1, 2, sum(lengths), 8) for _ in range(3)]
+    threads = torch.get_num_threads()
+    try:
+        # Read on every call; one PyTorch thread keeps per-sequence SDPA.
+        torch.set_num_threads(1)
+        expected = attention.global_(q, k, v, lengths)
+        assert attention._global_plan is None
+        torch.set_num_threads(attention.grouped_global_min_threads)
+        actual = attention.global_(q, k, v, lengths)
+        assert attention._global_plan is not None
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+    finally:
+        torch.set_num_threads(threads)
