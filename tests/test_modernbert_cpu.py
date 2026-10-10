@@ -155,6 +155,32 @@ def test_fused_rope_layout():
         assert attention.rope_buffer is None
 
 
+@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
+@torch.no_grad()
+def test_fused_geglu():
+    from packed_encoders.cpu.attention import CPUAttention
+    rng = torch.Generator().manual_seed(23)
+    # Odd width leaves a vector remainder; 67 rows end in a partial 32-row block
+    # split across workers. Edge activations cover zeros, tiny values and both
+    # saturated erf tails. Native and PyTorch GELU must meet the same FP64 bound.
+    edges = torch.tensor([0., -0., 1e-30, -1e-30, 4 * 2 ** .5, -4 * 2 ** .5, 6., -6., 30., -30.])
+    for threads in (1, 3):
+        attention = CPUAttention("native", 64, 64, threads)
+        for rows, width in ((67, 37), (7, 1152)):
+            hidden = torch.randn(1, rows, 2 * width, generator=rng) * 3
+            hidden.view(-1)[:len(edges)] = edges
+            a, gate = hidden.double().chunk(2, -1)
+            expected = (0.5 * a * (1 + torch.erf(a / 2 ** .5)) * gate).float()
+            attention.fused_geglu = False
+            torch.testing.assert_close(attention.geglu(hidden), expected, atol=2e-5, rtol=1e-6)
+            attention.fused_geglu = True
+            actual = attention.geglu(hidden)
+            assert actual.shape == (1, rows, width) and actual.is_contiguous()
+            torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-6)
+        attention.close()
+        assert attention.geglu_buffer is None
+
+
 @torch.no_grad()
 def test_grouped_global_attention():
     from packed_encoders.cpu.attention import CPUAttention
