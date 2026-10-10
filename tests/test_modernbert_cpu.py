@@ -4,6 +4,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers import ModernBertConfig, ModernBertModel
 
 import packed_encoders as pe
@@ -224,6 +225,43 @@ def test_fused_geglu():
             torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-6)
         attention.close()
         assert attention.geglu_buffer is None
+
+
+@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
+@torch.no_grad()
+def test_fused_add_norm():
+    from packed_encoders.cpu.attention import CPUAttention
+    rng = torch.Generator().manual_seed(31)
+    # 67 rows end in a partial 32-row block split across workers. Rows carry
+    # large offsets and an outlier channel, as ModernBERT's residual stream does;
+    # one row cancels to zero and one is constant (zero variance).
+    for threads in (1, 3):
+        attention = CPUAttention("native", 64, 64, threads)
+        for rows, width, bias in ((67, 64, True), (7, 768, False)):
+            norm = torch.nn.LayerNorm(width, bias=bias)
+            norm.weight.copy_(torch.randn(width, generator=rng) * 0.2 + 1)
+            if bias:
+                norm.bias.copy_(torch.randn(width, generator=rng) * 0.1)
+            x = torch.randn(1, rows, width, generator=rng) * 2 + torch.randn(width, generator=rng) * 5
+            x[..., 3] += 300
+            branch = torch.randn(1, rows, width, generator=rng)
+            x[0, 1], x[0, 2], branch[0, 2] = -branch[0, 1], 7, 0
+            stream = x + branch
+            expected = F.layer_norm(stream.double(), (width,), norm.weight.double(),
+                                    norm.bias.double() if bias else None, norm.eps).float()
+            for fused in (False, True):
+                attention.fused_norm = fused
+                inputs = x.clone()
+                actual_stream, actual = attention.add_norm(inputs, branch, norm)
+                assert torch.equal(actual_stream, stream) and (actual_stream is inputs) == fused
+                assert (actual is attention.norm_buffer) == fused and actual.shape == x.shape
+                torch.testing.assert_close(actual, expected, atol=5e-7, rtol=1e-6)
+            owned = attention.add_norm(x.clone(), branch, norm, owned=True)[1]
+            assert owned is not attention.norm_buffer and torch.equal(owned, actual)
+            identity = attention.add_norm(x, branch, torch.nn.Identity())
+            assert torch.equal(identity[0], stream) and identity[1] is identity[0]
+        attention.close()
+        assert attention.norm_buffer is None
 
 
 @pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")

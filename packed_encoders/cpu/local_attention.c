@@ -5,6 +5,7 @@
 // Build: clang -O3 -dynamiclib -framework Accelerate modernbert_local_attention.c -o attention.dylib
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
+#include <arm_neon.h>
 #include <dispatch/dispatch.h>
 #include <math.h>
 
@@ -192,5 +193,74 @@ int pe_geglu(const float *in, float *out, int rows, int width, int workers) {
     GegluContext context = {in, out, rows, width, workers};
     if (workers == 1) geglu_worker(&context, 0);
     else dispatch_apply_f(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &context, geglu_worker);
+    return 0;
+}
+
+// Residual add + LayerNorm over contiguous [rows, width] rows, width a multiple
+// of 32: residual += branch (bitwise PyTorch's add), then
+// out = (residual - mean) * rstd * weight (+ bias). Two-pass statistics with
+// eight vector accumulators per row: FP32-accurate, not bitwise PyTorch's
+// LayerNorm. A NULL bias means none. Only the explicit FMAs below fuse.
+#pragma clang fp contract(off)
+#define NORM_BLOCK 32
+typedef struct {
+    float *residual, *out;
+    const float *branch, *weight, *bias;
+    int rows, width, workers;
+    float eps;
+} NormContext;
+
+static inline float sum8(const float32x4_t s[8]) {
+    return vaddvq_f32(vaddq_f32(vaddq_f32(vaddq_f32(s[0], s[1]), vaddq_f32(s[2], s[3])),
+                                vaddq_f32(vaddq_f32(s[4], s[5]), vaddq_f32(s[6], s[7]))));
+}
+
+static void add_norm_row(const NormContext *c, int row) {
+    // Locals: NEON stores may alias the context, which would force reloads.
+    const int width = c->width;
+    const float *b = c->branch + (size_t)row * width, *weight = c->weight, *bias = c->bias;
+    float *r = c->residual + (size_t)row * width, *out = c->out + (size_t)row * width;
+    float32x4_t s[8];
+    for (int j = 0; j < 8; ++j) s[j] = vdupq_n_f32(0.f);
+    for (int i = 0; i < width; i += 32)
+        for (int j = 0; j < 8; ++j) {
+            float32x4_t x = vaddq_f32(vld1q_f32(r + i + 4 * j), vld1q_f32(b + i + 4 * j));
+            vst1q_f32(r + i + 4 * j, x);
+            s[j] = vaddq_f32(s[j], x);
+        }
+    float mean = sum8(s) / width;
+    float32x4_t m = vdupq_n_f32(mean);
+    for (int j = 0; j < 8; ++j) s[j] = vdupq_n_f32(0.f);
+    for (int i = 0; i < width; i += 32)
+        for (int j = 0; j < 8; ++j) {
+            float32x4_t d = vsubq_f32(vld1q_f32(r + i + 4 * j), m);
+            s[j] = vfmaq_f32(s[j], d, d);
+        }
+    float32x4_t rstd = vdupq_n_f32(1.f / sqrtf(sum8(s) / width + c->eps));
+    for (int i = 0; i < width; i += 32)
+        for (int j = 0; j < 8; ++j) {
+            float32x4_t y = vmulq_f32(vmulq_f32(vsubq_f32(vld1q_f32(r + i + 4 * j), m), rstd),
+                                      vld1q_f32(weight + i + 4 * j));
+            vst1q_f32(out + i + 4 * j, bias ? vaddq_f32(y, vld1q_f32(bias + i + 4 * j)) : y);
+        }
+}
+
+static void add_norm_worker(void *opaque, size_t worker_id) {
+    NormContext *c = opaque;
+    int blocks = (c->rows + NORM_BLOCK - 1) / NORM_BLOCK;
+    for (int block = (int)worker_id; block < blocks; block += c->workers) {
+        int end = (block + 1) * NORM_BLOCK < c->rows ? (block + 1) * NORM_BLOCK : c->rows;
+        for (int row = block * NORM_BLOCK; row < end; ++row) add_norm_row(c, row);
+    }
+}
+
+int pe_add_layer_norm(float *residual, const float *branch, const float *weight, const float *bias, float *out,
+                      int rows, int width, float eps, int workers) {
+    if (rows < 1 || width < 32 || width % 32 || workers < 1) return -1;
+    int tasks = (rows + NORM_BLOCK - 1) / NORM_BLOCK;
+    if (workers > tasks) workers = tasks;
+    NormContext context = {residual, out, branch, weight, bias, rows, width, workers, eps};
+    if (workers == 1) add_norm_worker(&context, 0);
+    else dispatch_apply_f(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &context, add_norm_worker);
     return 0;
 }

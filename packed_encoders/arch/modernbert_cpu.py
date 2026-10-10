@@ -322,17 +322,24 @@ class PackedModernBertCPU:
                   for kind, (cos, sin) in self.tables.items()}
         boundaries = torch.tensor(lengths, dtype=torch.int32)
         x = self.model.embeddings(ids[None])
-        for layer, kind in zip(self.layers, self.kinds):
-            qkv = F.linear(layer.attn_norm(x), layer.attn.Wqkv.weight, layer.attn.Wqkv.bias)
+        normed = self.layers[0].attn_norm(x)
+        # Each residual add feeds the next norm: this layer's MLP norm, then the
+        # next layer's attention norm or the final norm.
+        final = self.model.final_norm
+        following = (*(layer.attn_norm for layer in self.layers[1:]), final)
+        for layer, kind, after in zip(self.layers, self.kinds, following):
+            qkv = F.linear(normed, layer.attn.Wqkv.weight, layer.attn.Wqkv.bias)
             cos, sin = tables[kind]
             q, k, v = self.attention.rope_layout(qkv, cos, sin, self.heads, self.dim)
             context = (self.attention.local(q, k, v, lengths, boundaries) if kind == "sliding_attention"
                        else self.attention.global_(q, k, v, lengths, boundaries))
             context = context.transpose(1, 2).reshape_as(x)
-            x = x + F.linear(context, layer.attn.Wo.weight, layer.attn.Wo.bias)
-            hidden = F.linear(layer.mlp_norm(x), layer.mlp.Wi.weight, layer.mlp.Wi.bias)
-            x = x + F.linear(self.attention.geglu(hidden), layer.mlp.Wo.weight, layer.mlp.Wo.bias)
-        return self.model.final_norm(x)[0]
+            x, normed = self.attention.add_norm(x, F.linear(context, layer.attn.Wo.weight, layer.attn.Wo.bias),
+                                                layer.mlp_norm)
+            hidden = F.linear(normed, layer.mlp.Wi.weight, layer.mlp.Wi.bias)
+            x, normed = self.attention.add_norm(x, F.linear(self.attention.geglu(hidden), layer.mlp.Wo.weight,
+                                                            layer.mlp.Wo.bias), after, owned=after is final)
+        return normed[0]
 
     def validate(self):
         with self._lock:
