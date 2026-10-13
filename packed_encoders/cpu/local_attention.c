@@ -9,6 +9,8 @@
 #include <dispatch/dispatch.h>
 #include <math.h>
 
+#include "rows.h"
+
 typedef struct {
     const float *q, *k, *v;
     float *out, *scratch;
@@ -89,11 +91,9 @@ int pe_local_attention(const float *q, const float *k, const float *v,
     return 0;
 }
 
-// Split-half RoPE and token-major QKV -> head-major Q/K/V in one pass.
-// Keep multiply/add separate to match the unfused FP32 PyTorch operations.
+// Split-half RoPE and token-major QKV -> head-major Q/K/V in one pass (pe_rope_row).
 // Tasks are token blocks covering every head, so each QKV row is read once,
 // sequentially; head-major tasks re-walked the whole buffer once per head.
-#pragma clang fp contract(off)
 #define ROPE_BLOCK 32
 typedef struct {
     const float *qkv, *cos, *sin;
@@ -104,28 +104,12 @@ typedef struct {
 static void rope_worker(void *opaque, size_t worker_id) {
     RopeContext *c = opaque;
     int blocks = (c->tokens + ROPE_BLOCK - 1) / ROPE_BLOCK;
-    size_t plane = (size_t)c->heads * c->tokens * 64;
     for (int block = (int)worker_id; block < blocks; block += c->workers) {
         int begin = block * ROPE_BLOCK;
         int end = begin + ROPE_BLOCK < c->tokens ? begin + ROPE_BLOCK : c->tokens;
-        for (int token = begin; token < end; ++token) {
-            const float *row = c->qkv + (size_t)token * 3 * c->heads * 64;
-            const float *co = c->cos + (size_t)token * 64;
-            const float *si = c->sin + (size_t)token * 64;
-            for (int head = 0; head < c->heads; ++head) {
-                const float *src = row + (size_t)head * 64;
-                float *dst = c->out + ((size_t)head * c->tokens + token) * 64;
-                for (int part = 0; part < 2; ++part) {
-                    const float *in = src + part * c->heads * 64;
-                    float *out = dst + part * plane;
-                    for (int d = 0; d < 32; ++d) {
-                        out[d] = in[d] * co[d] + (-in[d + 32]) * si[d];
-                        out[d + 32] = in[d + 32] * co[d + 32] + in[d] * si[d + 32];
-                    }
-                }
-                for (int d = 0; d < 64; ++d) dst[2 * plane + d] = src[2 * c->heads * 64 + d];
-            }
-        }
+        for (int token = begin; token < end; ++token)
+            pe_rope_row(c->qkv + (size_t)token * 3 * c->heads * 64, c->cos + (size_t)token * 64,
+                        c->sin + (size_t)token * 64, c->out, token, c->tokens, c->heads);
     }
 }
 
@@ -141,10 +125,7 @@ int pe_rope_layout(const float *qkv, const float *cos, const float *sin,
 }
 
 // Exact-erf GeGLU: out[row, i] = GELU(in[row, i]) * in[row, width + i] for
-// contiguous MLP-input rows [activation | gate]. The rational erf (odd 13 /
-// even 8 degree, as in Eigen/TensorFlow) is within ~4e-7 of erf, comparable
-// to PyTorch's FP32 GELU; not the tanh approximation. Contraction is allowed.
-#pragma clang fp contract(on)
+// contiguous MLP-input rows [activation | gate] (pe_geglu_row, rational erf).
 #define GEGLU_BLOCK 32
 typedef struct {
     const float *in;
@@ -152,37 +133,14 @@ typedef struct {
     int rows, width, workers;
 } GegluContext;
 
-static inline float erf_rational(float a) {
-    float x = a > 4.f ? 4.f : (a < -4.f ? -4.f : a);
-    float x2 = x * x;
-    float p = x2 * -2.72614225801306e-10f + 2.77068142495902e-08f;
-    p = x2 * p + -2.10102402082508e-06f;
-    p = x2 * p + -5.69250639462346e-05f;
-    p = x2 * p + -7.34990630326855e-04f;
-    p = x2 * p + -2.95459980854025e-03f;
-    p = x2 * p + -1.60960333262415e-02f;
-    p = x * p;
-    float q = x2 * -1.45660718464996e-05f + -2.13374055278905e-04f;
-    q = x2 * q + -1.68282697438203e-03f;
-    q = x2 * q + -7.37332916720468e-03f;
-    q = x2 * q + -1.42647390514189e-02f;
-    // FP32 erf(4) rounds to 1, so saturate exactly beyond the fitted range.
-    return a >= 4.f ? 1.f : (a <= -4.f ? -1.f : p / q);
-}
-
 static void geglu_worker(void *opaque, size_t worker_id) {
     GegluContext *c = opaque;
     int blocks = (c->rows + GEGLU_BLOCK - 1) / GEGLU_BLOCK;
     for (int block = (int)worker_id; block < blocks; block += c->workers) {
         int begin = block * GEGLU_BLOCK;
         int end = begin + GEGLU_BLOCK < c->rows ? begin + GEGLU_BLOCK : c->rows;
-        for (int row = begin; row < end; ++row) {
-            const float *a = c->in + (size_t)row * 2 * c->width, *gate = a + c->width;
-            float *out = c->out + (size_t)row * c->width;
-#pragma clang loop interleave_count(4)
-            for (int i = 0; i < c->width; ++i)
-                out[i] = 0.5f * a[i] * (1.f + erf_rational(a[i] * 0.70710678118654752f)) * gate[i];
-        }
+        for (int row = begin; row < end; ++row)
+            pe_geglu_row(c->in + (size_t)row * 2 * c->width, c->out + (size_t)row * c->width, c->width);
     }
 }
 
@@ -197,11 +155,7 @@ int pe_geglu(const float *in, float *out, int rows, int width, int workers) {
 }
 
 // Residual add + LayerNorm over contiguous [rows, width] rows, width a multiple
-// of 32: residual += branch (bitwise PyTorch's add), then
-// out = (residual - mean) * rstd * weight (+ bias). Two-pass statistics with
-// eight vector accumulators per row: FP32-accurate, not bitwise PyTorch's
-// LayerNorm. A NULL bias means none. Only the explicit FMAs below fuse.
-#pragma clang fp contract(off)
+// of 32 (pe_add_norm_row): residual += branch, then the normalized row into out.
 #define NORM_BLOCK 32
 typedef struct {
     float *residual, *out;
@@ -210,39 +164,9 @@ typedef struct {
     float eps;
 } NormContext;
 
-static inline float sum8(const float32x4_t s[8]) {
-    return vaddvq_f32(vaddq_f32(vaddq_f32(vaddq_f32(s[0], s[1]), vaddq_f32(s[2], s[3])),
-                                vaddq_f32(vaddq_f32(s[4], s[5]), vaddq_f32(s[6], s[7]))));
-}
-
 static void add_norm_row(const NormContext *c, int row) {
-    // Locals: NEON stores may alias the context, which would force reloads.
-    const int width = c->width;
-    const float *b = c->branch + (size_t)row * width, *weight = c->weight, *bias = c->bias;
-    float *r = c->residual + (size_t)row * width, *out = c->out + (size_t)row * width;
-    float32x4_t s[8];
-    for (int j = 0; j < 8; ++j) s[j] = vdupq_n_f32(0.f);
-    for (int i = 0; i < width; i += 32)
-        for (int j = 0; j < 8; ++j) {
-            float32x4_t x = vaddq_f32(vld1q_f32(r + i + 4 * j), vld1q_f32(b + i + 4 * j));
-            vst1q_f32(r + i + 4 * j, x);
-            s[j] = vaddq_f32(s[j], x);
-        }
-    float mean = sum8(s) / width;
-    float32x4_t m = vdupq_n_f32(mean);
-    for (int j = 0; j < 8; ++j) s[j] = vdupq_n_f32(0.f);
-    for (int i = 0; i < width; i += 32)
-        for (int j = 0; j < 8; ++j) {
-            float32x4_t d = vsubq_f32(vld1q_f32(r + i + 4 * j), m);
-            s[j] = vfmaq_f32(s[j], d, d);
-        }
-    float32x4_t rstd = vdupq_n_f32(1.f / sqrtf(sum8(s) / width + c->eps));
-    for (int i = 0; i < width; i += 32)
-        for (int j = 0; j < 8; ++j) {
-            float32x4_t y = vmulq_f32(vmulq_f32(vsubq_f32(vld1q_f32(r + i + 4 * j), m), rstd),
-                                      vld1q_f32(weight + i + 4 * j));
-            vst1q_f32(out + i + 4 * j, bias ? vaddq_f32(y, vld1q_f32(bias + i + 4 * j)) : y);
-        }
+    size_t offset = (size_t)row * c->width;
+    pe_add_norm_row(c->residual + offset, c->branch + offset, c->weight, c->bias, c->out + offset, c->width, c->eps);
 }
 
 static void add_norm_worker(void *opaque, size_t worker_id) {
