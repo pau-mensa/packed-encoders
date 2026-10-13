@@ -338,16 +338,28 @@ def emulate_int8(engine, ids, lengths, positions):
     return engine._core(ids, lengths, positions, linear=linear)
 
 
+@torch.no_grad()
 def test_precision_option(model, monkeypatch):
     import packed_encoders.cpu.int8 as int8
-    original = model.forward
+    ids, mask = inputs()
+    reference = model(ids, attention_mask=mask).last_hidden_state[mask]
     with pytest.raises(PackedEncodersError, match="precision"):
         pe.pack(model, precision="int4")
+    # Machines without SME2 (M1-M3, other CPUs) or a compiler for it warn and stay FP32.
     monkeypatch.setattr(int8, "sme2_available", lambda: False)
-    with pytest.raises(PackedEncodersError, match="SME2"):
-        pe.pack(model, precision="int8")
-    assert model.forward == original
-    assert not hasattr(model, "_packed_encoders_installation")
+    with pytest.warns(UserWarning, match="SME2.*using exact FP32"):
+        pe.pack(model, precision="int8", attention_backend="sdpa")
+    engine = pe.get_engine(model)
+    assert engine.state.precision == engine.state.validation_report.precision == "fp32"
+    torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state[mask], reference, atol=2e-5, rtol=2e-5)
+    pe.pack(model, precision="int8")  # repeating the request or the precision in effect is fine
+    pe.pack(model, precision="fp32")
+    pe.unpack(model)
+    monkeypatch.setattr(int8, "sme2_available", lambda: True)
+    monkeypatch.setattr(int8, "library", lambda: (_ for _ in ()).throw(int8.Int8Unavailable("no compiler")))
+    with pytest.warns(UserWarning, match="no compiler; using exact FP32"):
+        pe.pack(model, precision="int8", attention_backend="sdpa")
+    pe.unpack(model)
     pe.pack(model, attention_backend="sdpa", precision="fp32")
     assert pe.get_engine(model).state.precision == "fp32"
     with pytest.raises(PackedEncodersError, match="unpack before changing the CPU precision"):

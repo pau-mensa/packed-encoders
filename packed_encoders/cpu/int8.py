@@ -32,6 +32,10 @@ CALIBRATION_ROWS, CALIBRATION_LENGTH = 16, 384
 TABLES = {"full_attention": 0, "sliding_attention": 1}
 
 
+class Int8Unavailable(PackedEncodersError):
+    """This machine cannot run the int8 kernels (no SME2, or no compiler for them)."""
+
+
 class _Model(ctypes.Structure):
     _fields_ = [("hidden", _I), ("heads", _I), ("width", _I), ("block_hidden", _I), ("block_width", _I),
                 ("signs_hidden", _P), ("signs_width", _P)]
@@ -72,8 +76,8 @@ def library():
         lib = ctypes.CDLL(str(path))
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
-        raise PackedEncodersError("precision='int8' needs the Xcode Command Line Tools with Apple M4 support "
-                                  "(xcrun clang -mcpu=apple-m4)") from exc
+        raise Int8Unavailable("precision='int8' needs the Xcode Command Line Tools with Apple M4 support "
+                              "(xcrun clang -mcpu=apple-m4)") from exc
     for name in ("pe_q8_input", "pe_q8_segment"):
         fn = getattr(lib, name)
         fn.argtypes, fn.restype = [_P] * 4 + [_I] * 2, _I
@@ -163,7 +167,7 @@ class Int8Projections:
         cfg, layers = engine.model.config, engine.layers
         hidden, heads, width = engine.hidden, engine.heads, cfg.intermediate_size
         if not sme2_available():
-            raise PackedEncodersError("precision='int8' needs an Apple CPU with SME2 (M4 or later)")
+            raise Int8Unavailable("precision='int8' needs an Apple CPU with SME2 (M4 or later)")
         if engine.dim != 64 or hidden % 64 or width % 64:
             raise UnsupportedTargetError("CPU int8 requires head_dim=64 and hidden/intermediate sizes divisible by 64")
         norms = [layer.mlp_norm for layer in layers] + [layer.attn_norm for layer in layers[1:]] + [engine.model.final_norm]
