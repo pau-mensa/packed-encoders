@@ -1,4 +1,4 @@
-"""Inference-only, padding-free FP32 ModernBERT CPU engine."""
+"""Inference-only, padding-free ModernBERT CPU engine: exact FP32, or opt-in int8 projections."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ from packed_encoders.state import ATTR
 _present = partial(is_not, None)
 _layout = attrgetter("dtype", "device", "shape")
 _training = attrgetter("training")
+# Pack-time gate for precision="int8" against the FP32 HF forward (see validate()).
+INT8_MEDIAN_COSINE, INT8_RELATIVE_L2 = 0.99, 0.25
 
 
 def _forward_hooks(module):
@@ -37,7 +39,8 @@ def _forward_hooks(module):
 
 
 def _options(options):
-    unknown = options.keys() - {"validate", "attention_backend", "cuda_graph", "train_cuda_graph", "cuda_graph_seq_cutoff"}
+    unknown = options.keys() - {"validate", "attention_backend", "cuda_graph", "train_cuda_graph", "cuda_graph_seq_cutoff",
+                                "precision"}
     if unknown:
         raise PackedEncodersError(f"unsupported CPU options: {sorted(unknown)}")
     for key in ("cuda_graph", "train_cuda_graph"):
@@ -47,6 +50,8 @@ def _options(options):
         raise PackedEncodersError("cuda_graph_seq_cutoff is unsupported on CPU")
     if options.get("attention_backend") not in (None, "auto", "native", "sdpa"):
         raise PackedEncodersError("CPU attention_backend must be 'auto', 'native' or 'sdpa'")
+    if options.get("precision") not in (None, "fp32", "int8"):
+        raise PackedEncodersError("CPU precision must be 'fp32' or 'int8'")
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,8 @@ class CPUValidationReport:
     relative_l2: float
     max_abs: float
     sequence_lengths: tuple[int, ...]
+    precision: str = "fp32"
+    median_cosine: float = 1.0
 
 
 class CPUAdapter:
@@ -88,7 +95,8 @@ class ModernBertCPU:
 
     def prepare(self, binding, options):
         _options(options)
-        packed = PackedModernBertCPU(binding, self, options.get("attention_backend") or "auto")
+        packed = PackedModernBertCPU(binding, self, options.get("attention_backend") or "auto",
+                                     options.get("precision") or "fp32")
         try:
             if options.get("validate", True):
                 packed.validate()
@@ -109,7 +117,7 @@ class PackedModernBertCPU:
     capabilities = Capabilities(original_forward_fallback=True)
     pieces = ()
 
-    def __init__(self, binding, engine, backend):
+    def __init__(self, binding, engine, backend, precision="fp32"):
         self.binding, self.model = binding, binding.weight_source
         self.original_forward = binding.patch_target.forward
         self._lock = threading.RLock()
@@ -157,13 +165,19 @@ class PackedModernBertCPU:
                 raise UnsupportedTargetError("CPU ModernBERT requires contiguous FP32 CPU parameters")
         self._configuration = self._config_signature()
         self.attention = CPUAttention(backend, self.dim, self.half, engine.threads or torch.get_num_threads())
-        self.state = SimpleNamespace(attention_backend=self.attention.backend, validation_report=None)
+        self.state = SimpleNamespace(attention_backend=self.attention.backend, validation_report=None,
+                                     precision=precision)
         self.tables = {}
         # Tables are engine-owned; HF parameters/storage and state_dict stay intact.
         for kind, theta in zip(("full_attention", "sliding_attention"), _rope_thetas(cfg)):
             inv = 1.0 / (theta ** (torch.arange(0, self.dim, 2).float() / self.dim))
             angles = torch.outer(torch.arange(self.max_position).float(), inv).repeat(1, 2)
             self.tables[kind] = (angles.cos(), angles.sin())
+        # Prepared int8 weights are engine-owned too; calibration runs the FP32 path above.
+        self.precision, self.int8 = precision, None
+        if precision == "int8":
+            from packed_encoders.cpu.int8 import Int8Projections
+            self.int8 = Int8Projections(self)
 
     def _structure_signature(self):
         # Child modules and parameter objects by identity, plus parameter storage,
@@ -214,6 +228,8 @@ class PackedModernBertCPU:
         backend = options.get("attention_backend")
         if backend is not None and backend not in (self.requested_backend, self.attention.backend):
             raise PackedEncodersError("unpack before changing the prepared CPU attention backend")
+        if options.get("precision") not in (None, self.precision):
+            raise PackedEncodersError("unpack before changing the CPU precision")
 
     def set_cuda_graph(self, enabled, config=None):
         self._check()
@@ -306,18 +322,19 @@ class PackedModernBertCPU:
             raise PackedEncodersError("CPU positions must be int64, match IDs, and lie within max_position_embeddings")
         if max(lengths) > self.max_tokens or max(lengths) > self.max_position:
             raise PackedEncodersError("sequence exceeds the engine's max_tokens or max_position_embeddings")
+        core = self._core if self.int8 is None else self.int8.core
         outputs, offset, group = [], 0, []
         for length in lengths:
             if group and sum(group) + length > self.max_tokens:
                 count = sum(group)
-                outputs.append(self._core(ids[offset:offset+count], tuple(group), positions[offset:offset+count]))
+                outputs.append(core(ids[offset:offset+count], tuple(group), positions[offset:offset+count]))
                 offset += count
                 group = []
             group.append(length)
-        outputs.append(self._core(ids[offset:], tuple(group), positions[offset:]))
+        outputs.append(core(ids[offset:], tuple(group), positions[offset:]))
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
-    def _core(self, ids, lengths, positions):
+    def _core(self, ids, lengths, positions, linear=F.linear):
         tables = {kind: (cos[positions][None, None], sin[positions][None, None])
                   for kind, (cos, sin) in self.tables.items()}
         boundaries = torch.tensor(lengths, dtype=torch.int32)
@@ -328,16 +345,16 @@ class PackedModernBertCPU:
         final = self.model.final_norm
         following = (*(layer.attn_norm for layer in self.layers[1:]), final)
         for layer, kind, after in zip(self.layers, self.kinds, following):
-            qkv = F.linear(normed, layer.attn.Wqkv.weight, layer.attn.Wqkv.bias)
+            qkv = linear(normed, layer.attn.Wqkv.weight, layer.attn.Wqkv.bias)
             cos, sin = tables[kind]
             q, k, v = self.attention.rope_layout(qkv, cos, sin, self.heads, self.dim)
             context = (self.attention.local(q, k, v, lengths, boundaries) if kind == "sliding_attention"
                        else self.attention.global_(q, k, v, lengths, boundaries))
             context = context.transpose(1, 2).reshape_as(x)
-            x, normed = self.attention.add_norm(x, F.linear(context, layer.attn.Wo.weight, layer.attn.Wo.bias),
+            x, normed = self.attention.add_norm(x, linear(context, layer.attn.Wo.weight, layer.attn.Wo.bias),
                                                 layer.mlp_norm)
-            hidden = F.linear(normed, layer.mlp.Wi.weight, layer.mlp.Wi.bias)
-            x, normed = self.attention.add_norm(x, F.linear(self.attention.geglu(hidden), layer.mlp.Wo.weight,
+            hidden = linear(normed, layer.mlp.Wi.weight, layer.mlp.Wi.bias)
+            x, normed = self.attention.add_norm(x, linear(self.attention.geglu(hidden), layer.mlp.Wo.weight,
                                                             layer.mlp.Wo.bias), after, owned=after is final)
         return normed[0]
 
@@ -358,8 +375,15 @@ class PackedModernBertCPU:
                     cosine = torch.where((actual.norm(dim=-1) == 0) & (reference.norm(dim=-1) == 0), 1., cosine)
                     report = CPUValidationReport(self.attention.backend, float(cosine.min()),
                                                  float(diff.norm() / reference.norm().clamp_min(1e-12)),
-                                                 float(diff.abs().max()), lengths)
-                    if not torch.isfinite(actual).all() or report.min_cosine < 0.99999 or report.relative_l2 > 2e-4:
+                                                 float(diff.abs().max()), lengths, self.precision,
+                                                 float(cosine.median()))
+                    # int8 cannot meet FP32 bounds: a few bistable tokens flip under any int8,
+                    # so its gate bounds the median token and the overall error instead.
+                    if self.precision == "fp32":
+                        failed = report.min_cosine < 0.99999 or report.relative_l2 > 2e-4
+                    else:
+                        failed = report.median_cosine < INT8_MEDIAN_COSINE or report.relative_l2 > INT8_RELATIVE_L2
+                    if not torch.isfinite(actual).all() or failed:
                         raise ValidationError(f"CPU ModernBERT output validation failed: {report}")
             finally:
                 for module, training in states:
@@ -369,6 +393,9 @@ class PackedModernBertCPU:
 
     def close(self, *, rollback=False):
         with self._lock:
+            if self.int8 is not None:
+                self.int8.close()
+                self.int8 = None
             self.attention.close()
             self.tables.clear()
             self.layers = ()

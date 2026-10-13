@@ -29,6 +29,7 @@ def pack(
     train_cuda_graph=OMITTED,
     cuda_graph_seq_cutoff=OMITTED,
     attention_backend=OMITTED,
+    precision=OMITTED,
     validate: bool = True,
 ) -> object:
     """Install the fused-tail forward onto `target` and return the same object.
@@ -69,6 +70,13 @@ def pack(
       A100, L40S, H200, and B200. Uncalibrated cards prefer Flash. SDPA is only the
       final no-kernel fallback.
 
+    `precision` (CPU ModernBERT engine only) selects the projection arithmetic:
+
+    - **`"fp32"` (default)** — exact FP32, validated against the HF forward.
+    - `"int8"` — int8 weights and activations on Apple CPUs with SME2 (M4 or later):
+      faster, approximate. Packing calibrates on random tokens (no data needed). Other
+      engines reject the option; changing it requires unpacking first.
+
     `validate` runs the hard gate during pack.
 
     Other architectures (see `packed_encoders.arch`) take the same call;
@@ -79,7 +87,7 @@ def pack(
     return _dispatch_pack(
         target, engine=engine, cuda_graph=cuda_graph, train_cuda_graph=train_cuda_graph,
         cuda_graph_seq_cutoff=cuda_graph_seq_cutoff, attention_backend=attention_backend,
-        validate=validate,
+        precision=precision, validate=validate,
     )
 
 

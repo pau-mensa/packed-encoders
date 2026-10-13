@@ -295,3 +295,143 @@ def test_native_global_full_model(model):
     actual = model(ids, attention_mask=mask).last_hidden_state
     torch.testing.assert_close(actual[mask], reference, atol=2e-5, rtol=2e-5)
     assert not actual[~mask].any()
+
+
+def _sme2():
+    from packed_encoders.cpu.int8 import sme2_available
+    return sme2_available()
+
+
+sme2 = pytest.mark.skipif(not _sme2(), reason="Apple SME2")
+
+
+def scale_projections(model, factor=4.):
+    # Random-init branches are tiny next to the residual stream, which would hide int8
+    # errors; scaled projections make them visible without leaving int8's working range.
+    with torch.no_grad():
+        for layer in model.layers:
+            for linear in (layer.attn.Wqkv, layer.attn.Wo, layer.mlp.Wi, layer.mlp.Wo):
+                linear.weight.mul_(factor)
+
+
+def emulate_int8(engine, ids, lengths, positions):
+    """The engine's FP32 loop with every projection replaced by the int8 scheme in float64:
+    rotate, quantize per row, multiply the prepared integer weights, dequantize."""
+    from packed_encoders.cpu.int8 import rotation
+    q8, g = engine.int8, engine.int8.geometry
+    hidden, width = rotation(g.hidden, g.block_hidden), rotation(g.width, g.block_width)
+    rotations = (hidden, None, hidden, width)  # the context arrives rotated through Wv
+    index = {id(weight): divmod(n, 4) for n, weight in enumerate(q8.weights)}
+
+    def linear(x, weight, bias=None):
+        layer, kind = index[id(weight)]
+        packed, scales = q8.prepared[kind]
+        n, k = weight.shape
+        rows = x.reshape(-1, k).double()
+        if rotations[kind] is not None:
+            rows = rows @ rotations[kind]
+        amax = rows.abs().amax(1, keepdim=True).clamp_min(1e-30)
+        q = torch.round(rows * 127 / amax).clamp(-127, 127)
+        w = packed[layer].transpose(-3, -2).reshape(n, k).double()
+        return ((q @ w.T) * (amax / 127) * scales[layer].double()).float().reshape(*x.shape[:-1], n)
+
+    return engine._core(ids, lengths, positions, linear=linear)
+
+
+def test_precision_option(model, monkeypatch):
+    import packed_encoders.cpu.int8 as int8
+    original = model.forward
+    with pytest.raises(PackedEncodersError, match="precision"):
+        pe.pack(model, precision="int4")
+    monkeypatch.setattr(int8, "sme2_available", lambda: False)
+    with pytest.raises(PackedEncodersError, match="SME2"):
+        pe.pack(model, precision="int8")
+    assert model.forward == original
+    assert not hasattr(model, "_packed_encoders_installation")
+    pe.pack(model, attention_backend="sdpa", precision="fp32")
+    assert pe.get_engine(model).state.precision == "fp32"
+    with pytest.raises(PackedEncodersError, match="unpack before changing the CPU precision"):
+        pe.pack(model, precision="int8")
+
+
+@sme2
+@torch.no_grad()
+def test_int8_kernels():
+    from packed_encoders.cpu.int8 import library, pack_weights, rotation, signs
+    lib, _ = library()
+    rng = torch.Generator().manual_seed(3)
+    # 7 and 16 rows take the single-block kernel; 45 rows leave an odd block for 2x2 tiles.
+    for m in (7, 16, 45):
+        n, k, blocks = 128, 192, (m + 15) // 16
+        a = torch.randint(-127, 128, (m, k), generator=rng, dtype=torch.int8)
+        w = torch.randint(-127, 128, (n, k), generator=rng, dtype=torch.int8)
+        rows = torch.zeros(blocks * 16, k, dtype=torch.int8)
+        rows[:m] = a
+        packed, weights = rows.view(blocks, 16, k // 4, 4).transpose(1, 2).contiguous(), pack_weights(w)
+        c = torch.empty(m, n, dtype=torch.int32)
+        lib.pe_q8_gemm(packed.data_ptr(), weights.data_ptr(), c.data_ptr(), m, n, k)
+        assert torch.equal(c.long(), a.long() @ w.long().T)
+    # Per-row quantization after 128- and 64-point rotations, or none; a zero row stays zero.
+    for k, block in ((256, 128), (192, 64), (192, 0)):
+        x = torch.randn(37, k, generator=rng) * torch.rand(k, generator=rng) * 4
+        x[3] = 0
+        s = signs(k, block).float() if block else None
+        packed, scale, scratch = torch.full((48 * k,), 9, dtype=torch.int8), torch.empty(37), torch.empty(k)
+        lib.pe_q8_quantize(x.data_ptr(), 37, k, None if s is None else s.data_ptr(), block,
+                           scratch.data_ptr(), packed.data_ptr(), scale.data_ptr())
+        q = packed.view(3, k // 4, 16, 4).transpose(1, 2).reshape(48, k)
+        assert not q[37:].any()
+        rotated = x.double() @ rotation(k, block) if block else x.double()
+        torch.testing.assert_close(scale.double(), rotated.abs().amax(1) / 127, rtol=1e-6, atol=0)
+        expected = torch.round(rotated / torch.where(scale > 0, scale, 1).double()[:, None])
+        difference = (q[:37].double() - expected).abs()
+        assert difference.max() <= 1 and (difference == 0).double().mean() > .999
+
+
+@sme2
+@torch.no_grad()
+def test_int8_matches_its_emulation(model):
+    scale_projections(model)
+    ids, mask = inputs()
+    reference = model(ids, attention_mask=mask).last_hidden_state[mask]
+    pe.pack(model, precision="int8", attention_backend="native")
+    engine = pe.get_engine(model)
+    assert engine.state.precision == engine.state.validation_report.precision == "int8"
+    out = model(ids, attention_mask=mask).last_hidden_state
+    assert not out[~mask].any()
+    relative = lambda a, b: float((a - b).norm() / b.norm())
+    # int8 is active, close to FP32, and exactly the intended scheme up to FP32 rounding.
+    assert 1e-3 < relative(out[mask], reference) < 2e-2
+    assert relative(out[mask], emulate_int8(engine, ids[mask], (7, 129), mask.nonzero()[:, 1])) < 1e-5
+    saved = out.clone()
+    model(ids.flip(1), attention_mask=mask)
+    torch.testing.assert_close(out, saved, atol=0, rtol=0)
+    batch = pe.PackedBatch(ids[mask], host_lengths=(7, 129))
+    torch.testing.assert_close(engine.forward_packed(batch), out[mask], atol=0, rtol=0)
+    # One worker and microbatches at sequence boundaries; repacking reproduces the weights.
+    pe.unpack(model)
+    assert engine.int8 is None
+    pe.pack(model, engine=pe.ModernBertCPU(threads=1), precision="int8", attention_backend="native")
+    torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state, out, atol=0, rtol=0)
+    pe.unpack(model)
+    pe.pack(model, engine=pe.ModernBertCPU(max_tokens=129), precision="int8", attention_backend="native")
+    torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state[mask], out[mask], atol=2e-5, rtol=2e-5)
+
+
+@sme2
+def test_int8_fallbacks_and_weight_updates(model):
+    ids, mask = inputs()
+    ids, mask = ids[:, :8], mask[:, :8]
+    original = model.forward
+    pe.pack(model, precision="int8", attention_backend="sdpa")
+    # Training and grad-enabled calls run the original FP32 forward.
+    model.train()
+    out = model(ids, attention_mask=mask).last_hidden_state
+    torch.testing.assert_close(out, original(ids, attention_mask=mask).last_hidden_state, atol=0, rtol=0)
+    model.eval()
+    with torch.no_grad():
+        model(ids, attention_mask=mask)
+        # Prepared int8 weights would go stale: in-place updates require a repack.
+        model.layers[0].mlp.Wo.weight.mul_(.9)
+        with pytest.raises(PackedEncodersError, match="repack"):
+            model(ids, attention_mask=mask)
