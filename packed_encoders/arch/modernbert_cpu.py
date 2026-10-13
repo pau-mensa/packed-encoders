@@ -8,6 +8,7 @@ from itertools import chain
 from operator import attrgetter, is_not
 import threading
 from types import SimpleNamespace
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -166,7 +167,7 @@ class PackedModernBertCPU:
         self._configuration = self._config_signature()
         self.attention = CPUAttention(backend, self.dim, self.half, engine.threads or torch.get_num_threads())
         self.state = SimpleNamespace(attention_backend=self.attention.backend, validation_report=None,
-                                     precision=precision)
+                                     precision="fp32")
         self.tables = {}
         # Tables are engine-owned; HF parameters/storage and state_dict stay intact.
         for kind, theta in zip(("full_attention", "sliding_attention"), _rope_thetas(cfg)):
@@ -174,10 +175,16 @@ class PackedModernBertCPU:
             angles = torch.outer(torch.arange(self.max_position).float(), inv).repeat(1, 2)
             self.tables[kind] = (angles.cos(), angles.sin())
         # Prepared int8 weights are engine-owned too; calibration runs the FP32 path above.
-        self.precision, self.int8 = precision, None
+        # Machines that cannot run them (M1-M3, other CPUs, no M4-capable compiler) warn
+        # and stay exact FP32; unsupported model shapes still raise.
+        self.requested_precision, self.int8 = precision, None
         if precision == "int8":
-            from packed_encoders.cpu.int8 import Int8Projections
-            self.int8 = Int8Projections(self)
+            from packed_encoders.cpu.int8 import Int8Projections, Int8Unavailable
+            try:
+                self.int8 = Int8Projections(self)
+            except Int8Unavailable as exc:
+                warnings.warn(f"{exc}; using exact FP32", stacklevel=4)
+        self.precision = self.state.precision = "fp32" if self.int8 is None else "int8"
 
     def _structure_signature(self):
         # Child modules and parameter objects by identity, plus parameter storage,
@@ -228,7 +235,7 @@ class PackedModernBertCPU:
         backend = options.get("attention_backend")
         if backend is not None and backend not in (self.requested_backend, self.attention.backend):
             raise PackedEncodersError("unpack before changing the prepared CPU attention backend")
-        if options.get("precision") not in (None, self.precision):
+        if options.get("precision") not in (None, self.requested_precision, self.precision):
             raise PackedEncodersError("unpack before changing the CPU precision")
 
     def set_cuda_graph(self, enabled, config=None):
