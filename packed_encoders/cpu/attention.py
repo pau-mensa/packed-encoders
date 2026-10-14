@@ -1,4 +1,5 @@
-"""Bounded CPU attention with an optional Apple Accelerate implementation."""
+"""Bounded CPU attention with an optional Apple Accelerate implementation, and native row kernels
+(RoPE/layout, GeGLU, residual LayerNorm) on Apple and Linux x86-64."""
 
 from __future__ import annotations
 
@@ -6,6 +7,7 @@ import ctypes
 from functools import lru_cache
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import tempfile
 import warnings
@@ -33,19 +35,60 @@ def _library():
         fn = library.pe_local_attention
         fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p, ctypes.c_size_t]
         fn.restype = ctypes.c_int
-        rope = library.pe_rope_layout
-        rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
-        rope.restype = ctypes.c_int
-        geglu = library.pe_geglu
-        geglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3
-        geglu.restype = ctypes.c_int
-        norm = library.pe_add_layer_norm
-        norm.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2 + [ctypes.c_float, ctypes.c_int]
-        norm.restype = ctypes.c_int
-        return library, directory
+        return _row_signatures(library), directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
         raise PackedEncodersError("Apple CPU attention needs the Xcode Command Line Tools (xcrun clang)") from exc
+
+
+def _row_signatures(library):
+    rope = library.pe_rope_layout
+    rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
+    rope.restype = ctypes.c_int
+    geglu = library.pe_geglu
+    geglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3
+    geglu.restype = ctypes.c_int
+    norm = library.pe_add_layer_norm
+    norm.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2 + [ctypes.c_float, ctypes.c_int]
+    norm.restype = ctypes.c_int
+    return library
+
+
+def _openmp_runtime():
+    # The runtime PyTorch already loaded (GNU, Intel or LLVM; all export the GOMP ABI).
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=5)
+                if len(fields) == 6 and Path(fields[5].strip()).name.startswith(("libgomp", "libiomp5", "libomp")):
+                    return fields[5].strip()
+    except OSError:
+        pass
+    return None
+
+
+@lru_cache(maxsize=1)
+def _rows_library():
+    # Process-private, as for the Apple library. GCC compiles the OpenMP pragmas (clang only targets
+    # LLVM's runtime); linking PyTorch's loaded runtime instead of -fopenmp's -lgomp keeps one pool.
+    runtime, compiler = _openmp_runtime(), shutil.which("gcc")
+    if runtime is None or compiler is None:
+        raise PackedEncodersError("native CPU row kernels need gcc and PyTorch's OpenMP runtime")
+    directory = tempfile.TemporaryDirectory(prefix="packed-encoders-rows-")
+    obj, path = Path(directory.name) / "rows.o", Path(directory.name) / "rows.so"
+    try:
+        subprocess.run(
+            [compiler, "-O3", "-march=native", "-fPIC", "-fopenmp", "-ffp-contract=off", "-fno-trapping-math",
+             "-fno-math-errno", "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-c",
+             str(Path(__file__).with_name("rows.c")), "-o", str(obj)],
+            check=True, capture_output=True, timeout=60,
+        )
+        subprocess.run([compiler, "-shared", str(obj), runtime, f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(path)],
+                       check=True, capture_output=True, timeout=60)
+        return _row_signatures(ctypes.CDLL(str(path))), directory
+    except (OSError, subprocess.SubprocessError) as exc:
+        directory.cleanup()
+        raise PackedEncodersError("native CPU row kernels need gcc with OpenMP") from exc
 
 
 class CPUAttention:
@@ -65,12 +108,20 @@ class CPUAttention:
                     raise
                 warnings.warn("Apple attention compiler unavailable; using tiled CPU SDPA", stacklevel=3)
         self.backend = "native" if self.library is not None else "sdpa"
+        # Row kernels: the Apple library carries them; Linux x86-64 builds rows.c. "sdpa" stays
+        # the pure-PyTorch reference path on both.
+        self.rows = self.library
+        if self.rows is None and backend != "sdpa" and platform.system() == "Linux" and platform.machine() == "x86_64":
+            try:
+                self.rows, _ = _rows_library()
+            except PackedEncodersError:
+                warnings.warn("native CPU row kernels unavailable (needs gcc); using PyTorch ops", stacklevel=3)
         self.scratch = self.output = None
         self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
         # Private ablation switches keep the original paths available to benchmarks.
-        self.fused_rope = self.library is not None
-        self.fused_geglu = self.library is not None
-        self.fused_norm = self.library is not None
+        self.fused_rope = self.rows is not None and head_dim == 64
+        self.fused_geglu = self.rows is not None
+        self.fused_norm = self.rows is not None
         # Native full-window attention beat per-sequence and grouped SDPA up to
         # 128 tokens on an Apple M4 at one and eight threads; SDPA won from 256.
         self.native_global = self.library is not None
@@ -87,7 +138,7 @@ class CPUAttention:
             shape = (3, 1, heads, tokens, dim)
             if self.rope_buffer is None or self.rope_buffer.shape != shape:
                 self.rope_buffer = torch.empty(shape, dtype=torch.float32)
-            status = self.library.pe_rope_layout(
+            status = self.rows.pe_rope_layout(
                 qkv.data_ptr(), cos.data_ptr(), sin.data_ptr(), self.rope_buffer.data_ptr(),
                 tokens, heads, self.threads,
             )
@@ -113,7 +164,7 @@ class CPUAttention:
         tokens, width = hidden.shape[1], hidden.shape[2] // 2
         if self.geglu_buffer is None or self.geglu_buffer.shape != (1, tokens, width):
             self.geglu_buffer = torch.empty((1, tokens, width), dtype=torch.float32)
-        status = self.library.pe_geglu(hidden.data_ptr(), self.geglu_buffer.data_ptr(), tokens, width, self.threads)
+        status = self.rows.pe_geglu(hidden.data_ptr(), self.geglu_buffer.data_ptr(), tokens, width, self.threads)
         if status:
             raise PackedEncodersError("native CPU GeGLU failed")
         return self.geglu_buffer
@@ -127,7 +178,8 @@ class CPUAttention:
         ``owned``, the normalized result borrows engine-owned storage and the
         caller holds the engine lock through its consumption.
         """
-        if not self.fused_norm or type(norm) is not nn.LayerNorm or norm.weight is None or "forward" in norm.__dict__:
+        if (not self.fused_norm or type(norm) is not nn.LayerNorm or norm.weight is None or "forward" in norm.__dict__
+                or x.shape[2] % 32):
             x = x + branch
             return x, norm(x)
         shape = x.shape
@@ -137,7 +189,7 @@ class CPUAttention:
             if self.norm_buffer is None or self.norm_buffer.shape != shape:
                 self.norm_buffer = torch.empty(shape, dtype=torch.float32)
             out = self.norm_buffer
-        status = self.library.pe_add_layer_norm(
+        status = self.rows.pe_add_layer_norm(
             x.data_ptr(), branch.data_ptr(), norm.weight.data_ptr(), None if norm.bias is None else norm.bias.data_ptr(),
             out.data_ptr(), shape[1], shape[2], norm.eps, self.threads,
         )

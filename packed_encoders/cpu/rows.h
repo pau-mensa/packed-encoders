@@ -1,9 +1,12 @@
-// Per-row FP32 bodies shared by the native CPU kernels (local_attention.c, int8.c).
+// Per-row FP32 bodies shared by the native CPU kernels (local_attention.c, int8.c, rows.c).
 // Each function sets its own contraction mode, so including files see the same arithmetic.
+// GCC ignores the clang pragmas; rows.c is built with -ffp-contract=off, so it never contracts.
 #ifndef PE_ROWS_H
 #define PE_ROWS_H
 
+#ifdef __ARM_NEON
 #include <arm_neon.h>
+#endif
 #include <math.h>
 #include <stddef.h>
 
@@ -59,15 +62,17 @@ static inline void pe_geglu_row(const float *in, float *out, int width) {
         out[i] = 0.5f * in[i] * (1.f + pe_erf(in[i] * 0.70710678118654752f)) * gate[i];
 }
 
+// Residual add + LayerNorm of one row, width a multiple of 32: r += b (bitwise PyTorch's
+// add), then out = (r - mean) * rstd * weight (+ bias). Two-pass statistics with eight
+// vector accumulators: FP32-accurate, not bitwise PyTorch's LayerNorm. A NULL bias means
+// none. Only the explicit FMAs below fuse. The portable version keeps the same 32 partial
+// sums and reduction order, so both produce the same bits.
+#ifdef __ARM_NEON
 static inline float pe_sum8(const float32x4_t s[8]) {
     return vaddvq_f32(vaddq_f32(vaddq_f32(vaddq_f32(s[0], s[1]), vaddq_f32(s[2], s[3])),
                                 vaddq_f32(vaddq_f32(s[4], s[5]), vaddq_f32(s[6], s[7]))));
 }
 
-// Residual add + LayerNorm of one row, width a multiple of 32: r += b (bitwise PyTorch's
-// add), then out = (r - mean) * rstd * weight (+ bias). Two-pass statistics with eight
-// vector accumulators: FP32-accurate, not bitwise PyTorch's LayerNorm. A NULL bias means
-// none. Only the explicit FMAs below fuse.
 static inline void pe_add_norm_row(float *r, const float *b, const float *weight, const float *bias,
                                    float *out, int width, float eps) {
 #pragma clang fp contract(off)
@@ -95,5 +100,40 @@ static inline void pe_add_norm_row(float *r, const float *b, const float *weight
             vst1q_f32(out + i + 4 * j, bias ? vaddq_f32(y, vld1q_f32(bias + i + 4 * j)) : y);
         }
 }
+#else
+// Partial sum c holds lane c % 4 of NEON accumulator c / 4; pe_sum8's tree, lane by lane.
+static inline float pe_sum32(const float p[32]) {
+#pragma clang fp contract(off)
+    float t[4];
+    for (int l = 0; l < 4; ++l)
+        t[l] = ((p[l] + p[4 + l]) + (p[8 + l] + p[12 + l])) + ((p[16 + l] + p[20 + l]) + (p[24 + l] + p[28 + l]));
+    return (t[0] + t[1]) + (t[2] + t[3]);
+}
+
+static inline void pe_add_norm_row(float *r, const float *b, const float *weight, const float *bias,
+                                   float *out, int width, float eps) {
+#pragma clang fp contract(off)
+    float p[32] = {0};
+    for (int i = 0; i < width; i += 32)
+        for (int c = 0; c < 32; ++c) {
+            float x = r[i + c] + b[i + c];
+            r[i + c] = x;
+            p[c] += x;
+        }
+    float mean = pe_sum32(p) / width;
+    for (int c = 0; c < 32; ++c) p[c] = 0.f;
+    for (int i = 0; i < width; i += 32)
+        for (int c = 0; c < 32; ++c) {
+            float d = r[i + c] - mean;
+            p[c] = fmaf(d, d, p[c]);
+        }
+    float rstd = 1.f / sqrtf(pe_sum32(p) / width + eps);
+    for (int i = 0; i < width; i += 32)
+        for (int c = 0; c < 32; ++c) {
+            float y = (r[i + c] - mean) * rstd * weight[i + c];
+            out[i + c] = bias ? y + bias[i + c] : y;
+        }
+}
+#endif
 
 #endif
