@@ -1,5 +1,4 @@
 """Small full-model CPU checks; no checkpoint downloads or CUDA packages."""
-import platform
 import sys
 
 import pytest
@@ -11,17 +10,16 @@ import packed_encoders as pe
 from packed_encoders.errors import PackedEncodersError, ValidationError
 
 
-def _rows_backend():
-    # The backend whose CPUAttention carries native row kernels here: Apple's Accelerate
-    # library, or rows.c on Linux x86-64 when gcc is available.
-    if platform.system() == "Darwin" and platform.machine() == "arm64":
-        return "native"
+def _native_kernels():
+    # What this machine builds: Apple's Accelerate library, or the gcc library on Linux x86-64.
     from packed_encoders.cpu.attention import CPUAttention
-    return "auto" if CPUAttention("auto", 64, 64, 1).rows is not None else None
+    attention = CPUAttention("auto", 64, 64, 1)
+    return attention.rows is not None, attention.library is not None
 
 
-ROWS = _rows_backend()
-native_rows = pytest.mark.skipif(ROWS is None, reason="native row kernels (Apple, or Linux x86-64 with gcc)")
+ROWS, NATIVE = _native_kernels()
+native_rows = pytest.mark.skipif(not ROWS, reason="native row kernels (Apple, or Linux x86-64 with gcc)")
+native_attention = pytest.mark.skipif(not NATIVE, reason="native attention (Apple, or Linux x86-64 with gcc)")
 
 
 @pytest.fixture
@@ -50,8 +48,8 @@ def inputs():
 @pytest.mark.parametrize("backend", ["sdpa", "auto", "native"])
 @torch.no_grad()
 def test_parity_and_owned_outputs(model, backend):
-    if backend == "native" and (platform.system() != "Darwin" or platform.machine() != "arm64"):
-        pytest.skip("Apple Accelerate")
+    if backend == "native" and not NATIVE:
+        pytest.skip("native attention")
     ids, mask = inputs()
     original = model.forward
     storage = {k: v.data_ptr() for k, v in model.state_dict().items()}
@@ -78,8 +76,8 @@ def test_parity_and_owned_outputs(model, backend):
 @torch.no_grad()
 @pytest.mark.parametrize("backend", ["sdpa", "native"])
 def test_direct_packed_microbatches_and_left_padding(model, backend):
-    if backend == "native" and (platform.system() != "Darwin" or platform.machine() != "arm64"):
-        pytest.skip("Apple Accelerate")
+    if backend == "native" and not NATIVE:
+        pytest.skip("native attention")
     ids, mask = inputs()
     mask[0] = mask[0].flip(0)
     ref = model(ids, attention_mask=mask).last_hidden_state[mask]
@@ -179,7 +177,7 @@ def test_fused_rope_layout():
     # three workers; 7 tokens clamp the workers to one block. Distinct angles
     # exercise both halves, repeated/nonmonotonic positions and several heads.
     for threads in (1, 3):
-        attention = CPUAttention(ROWS, 64, 64, threads)
+        attention = CPUAttention("auto", 64, 64, threads)
         for tokens in (67, 7):
             qkv = torch.randn(1, tokens, 3 * 3 * 64, generator=rng)
             positions = torch.randint(0, 129, (tokens,), generator=rng)
@@ -196,7 +194,7 @@ def test_fused_rope_layout():
         assert attention.rope_buffer is None
 
 
-@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
+@native_attention
 @torch.no_grad()
 def test_native_local_attention():
     from packed_encoders.cpu.attention import CPUAttention
@@ -224,7 +222,7 @@ def test_fused_geglu():
     # saturated erf tails. Native and PyTorch GELU must meet the same FP64 bound.
     edges = torch.tensor([0., -0., 1e-30, -1e-30, 4 * 2 ** .5, -4 * 2 ** .5, 6., -6., 30., -30.])
     for threads in (1, 3):
-        attention = CPUAttention(ROWS, 64, 64, threads)
+        attention = CPUAttention("auto", 64, 64, threads)
         for rows, width in ((67, 37), (7, 1152)):
             hidden = torch.randn(1, rows, 2 * width, generator=rng) * 3
             hidden.view(-1)[:len(edges)] = edges
@@ -249,7 +247,7 @@ def test_fused_add_norm():
     # large offsets and an outlier channel, as ModernBERT's residual stream does;
     # one row cancels to zero and one is constant (zero variance).
     for threads in (1, 3):
-        attention = CPUAttention(ROWS, 64, 64, threads)
+        attention = CPUAttention("auto", 64, 64, threads)
         for rows, width, bias in ((67, 64, True), (7, 768, False)):
             norm = torch.nn.LayerNorm(width, bias=bias)
             norm.weight.copy_(torch.randn(width, generator=rng) * 0.2 + 1)
@@ -277,7 +275,7 @@ def test_fused_add_norm():
         assert attention.norm_buffer is None
 
 
-@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
+@native_attention
 @torch.no_grad()
 def test_native_global_attention():
     from packed_encoders.cpu.attention import CPUAttention
@@ -296,7 +294,7 @@ def test_native_global_attention():
             attention.close()
 
 
-@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64", reason="Apple Accelerate")
+@native_attention
 @torch.no_grad()
 def test_native_global_full_model(model):
     lengths = torch.tensor([31, 1, 65, 7, 17])

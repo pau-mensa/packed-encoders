@@ -31,17 +31,16 @@ def _library():
              "-framework", "Accelerate", str(Path(__file__).with_name("local_attention.c")), "-o", str(path)],
             check=True, capture_output=True, timeout=30,
         )
-        library = ctypes.CDLL(str(path))
-        fn = library.pe_local_attention
-        fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p, ctypes.c_size_t]
-        fn.restype = ctypes.c_int
-        return _row_signatures(library), directory
+        return _signatures(ctypes.CDLL(str(path))), directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
         raise PackedEncodersError("Apple CPU attention needs the Xcode Command Line Tools (xcrun clang)") from exc
 
 
-def _row_signatures(library):
+def _signatures(library):
+    fn = library.pe_local_attention
+    fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p, ctypes.c_size_t]
+    fn.restype = ctypes.c_int
     rope = library.pe_rope_layout
     rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
     rope.restype = ctypes.c_int
@@ -68,27 +67,29 @@ def _openmp_runtime():
 
 
 @lru_cache(maxsize=1)
-def _rows_library():
+def _x86_library():
     # Process-private, as for the Apple library. GCC compiles the OpenMP pragmas (clang only targets
     # LLVM's runtime); linking PyTorch's loaded runtime instead of -fopenmp's -lgomp keeps one pool.
+    # Row kernels never contract (RoPE stays bitwise PyTorch's); attention accumulates with FMAs.
     runtime, compiler = _openmp_runtime(), shutil.which("gcc")
     if runtime is None or compiler is None:
-        raise PackedEncodersError("native CPU row kernels need gcc and PyTorch's OpenMP runtime")
-    directory = tempfile.TemporaryDirectory(prefix="packed-encoders-rows-")
-    obj, path = Path(directory.name) / "rows.o", Path(directory.name) / "rows.so"
+        raise PackedEncodersError("native x86 CPU kernels need gcc and PyTorch's OpenMP runtime")
+    directory = tempfile.TemporaryDirectory(prefix="packed-encoders-x86-")
+    here, out = Path(__file__).parent, Path(directory.name)
+    compile_ = [compiler, "-O3", "-march=native", "-fPIC", "-fopenmp", "-fno-trapping-math", "-fno-math-errno",
+                "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-c"]
+    sources = (("rows.c", "-ffp-contract=off"), ("local_attention_x86.c", "-ffp-contract=fast"))
     try:
-        subprocess.run(
-            [compiler, "-O3", "-march=native", "-fPIC", "-fopenmp", "-ffp-contract=off", "-fno-trapping-math",
-             "-fno-math-errno", "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-c",
-             str(Path(__file__).with_name("rows.c")), "-o", str(obj)],
-            check=True, capture_output=True, timeout=60,
-        )
-        subprocess.run([compiler, "-shared", str(obj), runtime, f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(path)],
+        for name, contract in sources:
+            subprocess.run([*compile_, contract, str(here / name), "-o", str(out / f"{name}.o")],
+                           check=True, capture_output=True, timeout=60)
+        subprocess.run([compiler, "-shared", *(str(out / f"{name}.o") for name, _ in sources), runtime,
+                        f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(out / "native.so")],
                        check=True, capture_output=True, timeout=60)
-        return _row_signatures(ctypes.CDLL(str(path))), directory
+        return _signatures(ctypes.CDLL(str(out / "native.so"))), directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
-        raise PackedEncodersError("native CPU row kernels need gcc with OpenMP") from exc
+        raise PackedEncodersError("native x86 CPU kernels need gcc with OpenMP") from exc
 
 
 class CPUAttention:
@@ -96,34 +97,36 @@ class CPUAttention:
 
     def __init__(self, backend, head_dim, half_window, threads, tile=64):
         self.tile, self.half, self.threads = tile, half_window, threads
-        native = platform.system() == "Darwin" and platform.machine() == "arm64" and head_dim == 64 and half_window == 64
-        self.library = None
+        apple = platform.system() == "Darwin" and platform.machine() == "arm64"
+        x86 = platform.system() == "Linux" and platform.machine() == "x86_64"
+        native = (apple or x86) and head_dim == 64 and half_window == 64
+        self.library = self.rows = None
         if backend == "native" and not native:
-            raise PackedEncodersError("native CPU attention requires Apple Silicon, head_dim=64 and local_attention=128")
-        if native and backend != "sdpa":
+            raise PackedEncodersError("native CPU attention requires Apple Silicon or Linux x86-64, head_dim=64 "
+                                      "and local_attention=128")
+        # One library carries the row kernels and, inside the envelope, native attention. Apple's
+        # loads only inside it; x86's row kernels serve any shape. "sdpa" stays pure PyTorch.
+        if backend != "sdpa" and (native or x86):
             try:
-                self.library, _ = _library()
+                self.rows, _ = _library() if apple else _x86_library()
             except PackedEncodersError:
                 if backend == "native":
                     raise
-                warnings.warn("Apple attention compiler unavailable; using tiled CPU SDPA", stacklevel=3)
+                warnings.warn("Apple attention compiler unavailable; using tiled CPU SDPA" if apple else
+                              "native x86 CPU kernels unavailable (needs gcc); using tiled CPU SDPA and PyTorch ops",
+                              stacklevel=3)
+            self.library = self.rows if native else None
         self.backend = "native" if self.library is not None else "sdpa"
-        # Row kernels: the Apple library carries them; Linux x86-64 builds rows.c. "sdpa" stays
-        # the pure-PyTorch reference path on both.
-        self.rows = self.library
-        if self.rows is None and backend != "sdpa" and platform.system() == "Linux" and platform.machine() == "x86_64":
-            try:
-                self.rows, _ = _rows_library()
-            except PackedEncodersError:
-                warnings.warn("native CPU row kernels unavailable (needs gcc); using PyTorch ops", stacklevel=3)
         self.scratch = self.output = None
         self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
         # Private ablation switches keep the original paths available to benchmarks.
         self.fused_rope = self.rows is not None and head_dim == 64
         self.fused_geglu = self.rows is not None
         self.fused_norm = self.rows is not None
+        self.native_local = self.library is not None
         # Native full-window attention beat per-sequence and grouped SDPA up to
         # 128 tokens on an Apple M4 at one and eight threads; SDPA won from 256.
+        # A Zen 5 agreed (native ahead through 192, SDPA from 256).
         self.native_global = self.library is not None
 
     def rope_layout(self, qkv, cos, sin, heads, dim):
@@ -198,7 +201,7 @@ class CPUAttention:
         return x, out
 
     def local(self, q, k, v, lengths, boundaries):
-        if self.library is None:
+        if not self.native_local:
             return self._sdpa(q, k, v, lengths, local=True)
         return self._native(q, k, v, lengths, boundaries, self.half)
 
@@ -212,7 +215,9 @@ class CPUAttention:
         q, k, v = (t.contiguous() for t in (q, k, v))
         _, heads, tokens, dim = q.shape
         workers = min(self.threads, heads * len(lengths))
-        needed = workers * self.tile * min(self.tile + 2 * half, max(lengths))
+        # Scores [tile, columns] per worker; x86 also transposes the key window, padded to 16 keys.
+        columns = -(-min(self.tile + 2 * half, max(lengths)) // 16) * 16
+        needed = workers * (self.tile + 64) * columns
         if self.scratch is None or self.scratch.numel() < needed:
             self.scratch = torch.empty(needed, dtype=torch.float32)
         if self.output is None or self.output.shape != q.shape:
