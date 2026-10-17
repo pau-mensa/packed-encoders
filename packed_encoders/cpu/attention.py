@@ -1,5 +1,6 @@
-"""Bounded CPU attention with an optional Apple Accelerate implementation, and native row kernels
-(RoPE/layout, GeGLU, residual LayerNorm) on Apple and Linux x86-64."""
+"""Bounded CPU attention with an optional Apple Accelerate implementation, native row kernels
+(RoPE/layout, GeGLU, residual LayerNorm) on Apple and Linux x86-64, and native FP32 projections on
+Linux x86-64."""
 
 from __future__ import annotations
 
@@ -70,15 +71,19 @@ def _openmp_runtime():
 def _x86_library():
     # Process-private, as for the Apple library. GCC compiles the OpenMP pragmas (clang only targets
     # LLVM's runtime); linking PyTorch's loaded runtime instead of -fopenmp's -lgomp keeps one pool.
-    # Row kernels never contract (RoPE stays bitwise PyTorch's); attention accumulates with FMAs.
+    # Row kernels never contract (RoPE stays bitwise PyTorch's); attention and the projection GEMM
+    # accumulate with FMAs.
+    # The static vector helpers stay within their translation units; their AVX2 psABI warning
+    # is harmless and must not turn into a build failure under -Werror.
     runtime, compiler = _openmp_runtime(), shutil.which("gcc")
     if runtime is None or compiler is None:
         raise PackedEncodersError("native x86 CPU kernels need gcc and PyTorch's OpenMP runtime")
     directory = tempfile.TemporaryDirectory(prefix="packed-encoders-x86-")
     here, out = Path(__file__).parent, Path(directory.name)
     compile_ = [compiler, "-O3", "-march=native", "-fPIC", "-fopenmp", "-fno-trapping-math", "-fno-math-errno",
-                "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-c"]
-    sources = (("rows.c", "-ffp-contract=off"), ("local_attention_x86.c", "-ffp-contract=fast"))
+                "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-Wno-psabi", "-c"]
+    sources = (("rows.c", "-ffp-contract=off"), ("local_attention_x86.c", "-ffp-contract=fast"),
+               ("gemm_x86.c", "-ffp-contract=fast"))
     try:
         for name, contract in sources:
             subprocess.run([*compile_, contract, str(here / name), "-o", str(out / f"{name}.o")],
@@ -86,7 +91,11 @@ def _x86_library():
         subprocess.run([compiler, "-shared", *(str(out / f"{name}.o") for name, _ in sources), runtime,
                         f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(out / "native.so")],
                        check=True, capture_output=True, timeout=60)
-        return _signatures(ctypes.CDLL(str(out / "native.so"))), directory
+        library = _signatures(ctypes.CDLL(str(out / "native.so")))
+        if hasattr(library, "pe_linear"):
+            library.pe_linear.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4
+            library.pe_linear.restype = ctypes.c_int
+        return library, directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
         raise PackedEncodersError("native x86 CPU kernels need gcc with OpenMP") from exc
@@ -133,6 +142,7 @@ class CPUAttention:
         self.backend = "native" if self.library is not None else "sdpa"
         self.scratch = self.output = None
         self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
+        self.linear_buffers = {}
         # Private ablation switches keep the original paths available to benchmarks.
         self.fused_rope = self.rows is not None and head_dim == 64
         self.fused_geglu = self.rows is not None
@@ -145,6 +155,9 @@ class CPUAttention:
         # Native attention stores token-major context for callers that ask for it, instead
         # of a head-major result they would transpose into a copy.
         self.token_major = self.library is not None
+        # x86 projections: MKL does not pick its AVX-512 kernels on AMD; the native GEMM reads the
+        # original weights (Apple keeps Accelerate through F.linear).
+        self.native_linear = self.rows is not None and x86 and hasattr(self.rows, "pe_linear")
 
     def rope_layout(self, qkv, cos, sin, heads, dim):
         """Internal FP32 conversion; native results borrow engine-owned storage.
@@ -170,6 +183,28 @@ class CPUAttention:
             a, b = t.chunk(2, -1)
             return t * cos + torch.cat((-b, a), -1) * sin
         return rotate(q), rotate(k), v
+
+    def linear(self, x, weight, bias=None):
+        """FP32 x @ weight.T + bias; native results borrow engine-owned storage.
+
+        Weight [N, K] and bias are contiguous FP32 (the engine's parameter aliases). Activations
+        that are not contiguous FP32 [..., K] take F.linear, so native code never reads or writes
+        past a tensor. One buffer per output width: the caller holds the engine lock and consumes
+        each result before the next projection of that width (requests never fault in fresh GEMM
+        outputs).
+        """
+        n, k = weight.shape
+        if not self.native_linear or x.dtype != torch.float32 or x.shape[-1] != k or not x.is_contiguous():
+            return F.linear(x, weight, bias)
+        shape = (*x.shape[:-1], n)
+        out = self.linear_buffers.get(n)
+        if out is None or out.shape != shape:
+            out = self.linear_buffers[n] = torch.empty(shape, dtype=torch.float32)
+        status = self.rows.pe_linear(x.data_ptr(), weight.data_ptr(), None if bias is None else bias.data_ptr(),
+                                     out.data_ptr(), x.numel() // k, n, k, self.threads)
+        if status:
+            raise PackedEncodersError("native CPU projection failed")
+        return out
 
     def geglu(self, hidden):
         """Exact-erf GELU(activation) * gate; native results borrow engine-owned storage.
@@ -277,3 +312,4 @@ class CPUAttention:
     def close(self):
         self.output = self.scratch = None
         self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
+        self.linear_buffers = {}

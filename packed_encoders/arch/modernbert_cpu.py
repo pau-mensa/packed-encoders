@@ -14,6 +14,7 @@ from torch import nn
 from packed_encoders.batch import PackedBatch
 from packed_encoders.config import _rope_thetas
 from packed_encoders.cpu.attention import CPUAttention, ResolvedNorm
+from packed_encoders.cpu.memory import rehome
 from packed_encoders.engine import Capabilities, ModelBinding, ValidationResult
 from packed_encoders.errors import PackedEncodersError, UnsupportedTargetError, ValidationError
 from packed_encoders.locate import is_modernbert_encoder
@@ -81,16 +82,26 @@ class ModernBertCPU:
 
     Matrix operations use PyTorch/Accelerate's existing thread settings. This
     engine never changes process-global threading configuration.
+
+    ``rehome_weights=True`` moves the projection weights into fresh process
+    memory when packing (same Parameter objects and values, new storage). It
+    can speed up FP32 when they sit in from_pretrained's safetensors file mapping.
+    On Linux, best-effort page eviction limits the extra resident memory; on other
+    platforms this only copies. In-place updates and state_dict keep
+    working; references to the old storage taken before packing stop aliasing
+    the model. Unpacking does not move them back.
     """
     name = "modernbert-cpu"
     adapters = (CPUAdapter(),)
 
-    def __init__(self, *, threads=None, max_tokens=32768):
+    def __init__(self, *, threads=None, max_tokens=32768, rehome_weights=False):
         if threads is not None and (type(threads) is not int or threads <= 0):
             raise ValueError("threads must be a positive integer")
         if type(max_tokens) is not int or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
-        self.threads, self.max_tokens = threads, max_tokens
+        if type(rehome_weights) is not bool:
+            raise ValueError("rehome_weights must be a bool")
+        self.threads, self.max_tokens, self.rehome_weights = threads, max_tokens, rehome_weights
 
     def prepare(self, binding, options):
         _options(options)
@@ -152,6 +163,10 @@ class PackedModernBertCPU:
             if param.device.type != "cpu" or param.dtype != torch.float32 or not param.is_contiguous():
                 raise UnsupportedTargetError("CPU ModernBERT requires contiguous FP32 CPU parameters")
         self.attention = CPUAttention(backend, self.dim, self.half, engine.threads or torch.get_num_threads())
+        if engine.rehome_weights:  # before the plan takes its aliases
+            rehome([param for layer in self.layers
+                    for projection in (layer.attn.Wqkv, layer.attn.Wo, layer.mlp.Wi, layer.mlp.Wo)
+                    for param in (projection.weight, projection.bias) if param is not None])
         # What _core reads per layer, resolved once: the attention kind, (weight, bias) aliases
         # of the four projections, the two norms it applies, and whether the second is the final
         # norm. Aliases share the parameters' storage, so in-place updates are read. Requests
@@ -342,13 +357,14 @@ class PackedModernBertCPU:
         outputs.append(core(ids[offset:], tuple(group), positions[offset:]))
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
-    def _core(self, ids, lengths, positions, linear=F.linear):
+    def _core(self, ids, lengths, positions, linear=None):
         tables = {kind: (cos[positions][None, None], sin[positions][None, None])
                   for kind, (cos, sin) in self.tables.items()}
         boundaries = torch.tensor(lengths, dtype=torch.int32)
         x = self.model.embeddings(ids[None])
         normed = self.layers[0].attn_norm(x)
         cpu = self.attention
+        linear = linear or cpu.linear
         # Each residual add feeds the next norm: this layer's MLP norm, then the
         # next layer's attention norm or the final norm.
         for kind, (wqkv, bqkv), (wo, bo), (wi, bi), (wmo, bmo), mlp_norm, after, final in self.plan:

@@ -14,12 +14,13 @@ def _native_kernels():
     # What this machine builds: Apple's Accelerate library, or the gcc library on Linux x86-64.
     from packed_encoders.cpu.attention import CPUAttention
     attention = CPUAttention("auto", 64, 64, 1)
-    return attention.rows is not None, attention.library is not None
+    return attention.rows is not None, attention.library is not None, attention.native_linear
 
 
-ROWS, NATIVE = _native_kernels()
+ROWS, NATIVE, LINEAR = _native_kernels()
 native_rows = pytest.mark.skipif(not ROWS, reason="native row kernels (Apple, or Linux x86-64 with gcc)")
 native_attention = pytest.mark.skipif(not NATIVE, reason="native attention (Apple, or Linux x86-64 with gcc)")
+native_linear = pytest.mark.skipif(not LINEAR, reason="native FP32 projections (Linux x86-64 with gcc)")
 
 
 @pytest.fixture
@@ -308,6 +309,113 @@ def test_fused_add_norm():
             assert torch.equal(identity[0], stream) and identity[1] is identity[0]
         attention.close()
         assert attention.norm_buffer is None
+
+
+@native_linear
+@torch.no_grad()
+def test_native_linear():
+    from packed_encoders.cpu.attention import CPUAttention
+    rng = torch.Generator().manual_seed(37)
+    # Remainders in every dimension: activation rows (3/4-row tiles), weight rows (8/6-row blocks split
+    # across workers) and K (16-float steps, masked tail). Every output must be the same bits whatever
+    # the thread count or the batch its row shares (one accumulation order and reduction tree).
+    attentions = [CPUAttention("auto", 64, 64, threads) for threads in (1, 3, 8)]
+    for rows, n, k, bias in ((0, 8, 16, False), (1, 1, 1, True), (7, 9, 17, False), (19, 37, 33, True),
+                             (5, 768, 1152, False), (32, 2304, 768, True), (16, 23, 768, False),
+                             (7, 13, 1152, True), (32, 768, 1152, False), (256, 17, 1152, True)):
+        x = torch.randn(1, rows, k, generator=rng)
+        w = torch.randn(n, k, generator=rng) * 0.05
+        b = torch.randn(n, generator=rng) if bias else None
+        outs = [attention.linear(x, w, b).clone() for attention in attentions]
+        assert outs[0].shape == (1, rows, n)
+        assert all(torch.equal(outs[0], out) for out in outs[1:])
+        if rows:
+            expected = F.linear(x.double(), w.double(), None if b is None else b.double())
+            assert (outs[0].double() - expected).norm() / expected.norm() < 1e-6
+        for row in range(rows):
+            assert torch.equal(attentions[1].linear(x[:, row:row + 1].contiguous(), w, b)[0, 0], outs[0][0, row])
+    attention = attentions[0]
+    # One borrowed buffer per output width; inputs that are not contiguous FP32 take F.linear.
+    x, w = torch.randn(1, 6, 40, generator=rng), torch.randn(24, 40, generator=rng)
+    first = attention.linear(x, w)
+    assert attention.linear(x + 1, w) is first is attention.linear_buffers[24]
+    assert torch.equal(attention.linear(x.transpose(1, 2), w[:, :6]), F.linear(x.transpose(1, 2), w[:, :6]))
+    assert torch.equal(attention.linear(x.double(), w.double()), F.linear(x.double(), w.double()))
+    with pytest.raises(RuntimeError):  # mismatched K reaches F.linear's error, never native code
+        attention.linear(torch.randn(1, 6, 80), w)
+    attention.native_linear = False
+    assert torch.equal(attention.linear(x, w), F.linear(x, w))
+    for attention in attentions:
+        attention.close()
+        assert attention.linear_buffers == {}
+
+
+@native_linear
+@torch.no_grad()
+def test_avx2_build_keeps_native_rows_and_attention(model, monkeypatch):
+    import packed_encoders.cpu.attention as cpu
+
+    # Compile and execute the AVX2 target on this AVX-512 host. The optional GEMM
+    # must not disable the existing row/attention kernels when its ISA is absent.
+    run = cpu.subprocess.run
+
+    def avx2(command, **kwargs):
+        command = ["-march=x86-64-v3" if arg == "-march=native" else arg for arg in command]
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(cpu.subprocess, "run", avx2)
+    library, directory = cpu._x86_library.__wrapped__()
+    monkeypatch.setattr(cpu, "_x86_library", lambda: (library, directory))
+    assert not hasattr(library, "pe_linear")
+    pe.pack(model, attention_backend="native")  # also validates full-model FP32 parity
+    attention = pe.get_engine(model).attention
+    assert attention.rows is library and attention.library is library
+    assert attention.fused_rope and attention.fused_geglu and attention.fused_norm
+    assert not attention.native_linear
+
+
+@native_linear
+@torch.no_grad()
+def test_native_linear_reads_live_weights(model):
+    ids, mask = inputs()
+    original = model.forward
+    pe.pack(model)
+    assert pe.get_engine(model).attention.native_linear
+    for layer in model.layers:
+        layer.attn.Wqkv.weight.mul_(1.05)
+        layer.mlp.Wo.weight.mul_(.9)
+    torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state[mask],
+                               original(ids, attention_mask=mask).last_hidden_state[mask], atol=2e-5, rtol=2e-5)
+
+
+@torch.no_grad()
+def test_rehome_weights(model, tmp_path):
+    from packed_encoders.cpu.memory import rehome
+    with pytest.raises(ValueError):
+        pe.ModernBertCPU(rehome_weights=1)
+    ids, mask = inputs()
+    expected = model(ids, attention_mask=mask).last_hidden_state
+    projections = [p for layer in model.layers for p in (layer.attn.Wqkv.weight, layer.attn.Wo.weight,
+                                                         layer.mlp.Wi.weight, layer.mlp.Wo.weight)]
+    before = [(p, p.data_ptr(), p.detach().clone()) for p in projections]
+    others = {name: p.data_ptr() for name, p in model.named_parameters() if not any(p is q for q in projections)}
+    pe.pack(model, engine=pe.ModernBertCPU(rehome_weights=True))
+    for (param, pointer, values), now in zip(before, projections):
+        assert now is param and param.data_ptr() != pointer and torch.equal(param, values)
+    assert all(p.data_ptr() == others[name] for name, p in model.named_parameters() if name in others)
+    torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state[mask], expected[mask],
+                               atol=2e-5, rtol=2e-5)
+    model.layers[0].mlp.Wo.weight.mul_(.9)  # in-place updates reach the moved storage
+    assert torch.equal(pe.get_engine(model).plan[0][4][0], model.layers[0].mlp.Wo.weight)
+    # A private file mapping, as from_pretrained leaves safetensors weights: the pages left
+    # behind are paged out, which must not change what the old storage reads.
+    path = tmp_path / "weights.bin"
+    data = torch.randn(3 * 4096)
+    data.numpy().tofile(path)
+    mapped = torch.from_file(str(path), shared=False, size=data.numel(), dtype=torch.float32)
+    param = torch.nn.Parameter(mapped, requires_grad=False)
+    rehome([param])
+    assert param.data_ptr() != mapped.data_ptr() and torch.equal(param, data) and torch.equal(mapped, data)
 
 
 @native_attention
