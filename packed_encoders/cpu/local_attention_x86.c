@@ -1,5 +1,6 @@
 // FP32 ModernBERT local attention for x86 CPUs: pe_local_attention of local_attention.c without
-// Accelerate. Q/K/V/output: contiguous [heads, total_tokens, 64]. Lengths delimit sequences.
+// Accelerate. Q/K/V: contiguous [heads, total_tokens, 64]; output the same, or token-major
+// [total_tokens, heads * 64] (the next projection's input layout). Lengths delimit sequences.
 // Queries attend keys within `half` positions in their sequence; a half-width of at least the
 // longest sequence gives exact global attention. No fast-math; built with contraction on (unlike
 // rows.c), so the dot products accumulate with FMAs.
@@ -89,9 +90,9 @@ static float softmax_row(float *s, int first, int last, int lo, int hi) {
     return 1.f / total;
 }
 
-// Output rows = (P V) * inverse sums for R rows over window columns [lo, hi) of V (stride 64).
+// Output rows (stride ldo) = (P V) * inverse sums for R rows over window columns [lo, hi) of V (stride 64).
 static inline __attribute__((always_inline)) void pv(const float *p, int ld, const float *v, int lo, int hi,
-                                                     const float *inverse, float *out, const int R) {
+                                                     const float *inverse, float *out, int ldo, const int R) {
     v16 acc[4][4];
     for (int r = 0; r < R; ++r)
         for (int x = 0; x < 4; ++x) acc[r][x] = (v16){};
@@ -107,21 +108,23 @@ static inline __attribute__((always_inline)) void pv(const float *p, int ld, con
         }
     }
     for (int r = 0; r < R; ++r)
-        for (int x = 0; x < 4; ++x) store(out + (size_t)r * 64 + 16 * x, acc[r][x] * inverse[r]);
+        for (int x = 0; x < 4; ++x) store(out + (size_t)r * ldo + 16 * x, acc[r][x] * inverse[r]);
 }
 
-static void pv_block(const float *p, int ld, const float *v, int lo, int hi, const float *inverse, float *out, int R) {
+static void pv_block(const float *p, int ld, const float *v, int lo, int hi, const float *inverse, float *out,
+                     int ldo, int R) {
     switch (R) {
-        case 1: pv(p, ld, v, lo, hi, inverse, out, 1); break;
-        case 2: pv(p, ld, v, lo, hi, inverse, out, 2); break;
-        case 3: pv(p, ld, v, lo, hi, inverse, out, 3); break;
-        default: pv(p, ld, v, lo, hi, inverse, out, 4); break;
+        case 1: pv(p, ld, v, lo, hi, inverse, out, ldo, 1); break;
+        case 2: pv(p, ld, v, lo, hi, inverse, out, ldo, 2); break;
+        case 3: pv(p, ld, v, lo, hi, inverse, out, ldo, 3); break;
+        default: pv(p, ld, v, lo, hi, inverse, out, ldo, 4); break;
     }
 }
 
-// One query tile [start, start + rows) of one head and sequence (base: its first token).
-static void tile_attention(const float *q, const float *k, const float *v, float *out, float *kt, float *scores,
-                           int length, int start, int rows, int half) {
+// One query tile [start, start + rows) of one head and sequence (q/k/v/out: its first token;
+// output rows ldo apart).
+static void tile_attention(const float *q, const float *k, const float *v, float *out, int ldo, float *kt,
+                           float *scores, int length, int start, int rows, int half) {
     int lo = start > half ? start - half : 0;
     int hi = start + rows + half < length ? start + rows + half : length;
     int cols = hi - lo, ld = (cols + 15) / 16 * 16;
@@ -143,12 +146,12 @@ static void tile_attention(const float *q, const float *k, const float *v, float
         qk_block(q + (size_t)(start + r0) * 64, kt, s, ld, R, c_lo, c_hi);
         float inverse[4];
         for (int r = 0; r < R; ++r) inverse[r] = softmax_row(s + (size_t)r * ld, first[r], last[r], c_lo, c_hi);
-        pv_block(s, ld, v + (size_t)lo * 64, first[0], last[R - 1], inverse, out + (size_t)(start + r0) * 64, R);
+        pv_block(s, ld, v + (size_t)lo * 64, first[0], last[R - 1], inverse, out + (size_t)(start + r0) * ldo, ldo, R);
     }
 }
 
 int pe_local_attention(const float *q, const float *k, const float *v, float *out, const int *lengths, int tokens,
-                       int heads, int sequences, int tile, int half, int workers, float *scratch,
+                       int heads, int sequences, int tile, int half, int token_major, int workers, float *scratch,
                        size_t scratch_floats) {
     if (tokens < 1 || heads < 1 || sequences < 1 || tile < 1 || tile > 4096 || half < 0 || workers < 1)
         return -1;
@@ -166,15 +169,16 @@ int pe_local_attention(const float *q, const float *k, const float *v, float *ou
     size_t ld = (size_t)(columns + 15) / 16 * 16, per_worker = (64 + (size_t)tile) * ld;
     if (workers > heads * sequences) workers = heads * sequences;
     if (!scratch || scratch_floats < (size_t)workers * per_worker) return -2;
-    int offsets[sequences];
+    int offsets[sequences], ldo = token_major ? heads * 64 : 64;
     for (int i = 0, offset = 0; i < sequences; offset += lengths[i++]) offsets[i] = offset;
 #pragma omp parallel for num_threads(workers) if (workers > 1) schedule(dynamic, 1)
     for (int task = 0; task < heads * sequences; ++task) {
         int head = task / sequences, sequence = task % sequences, length = lengths[sequence];
         size_t base = ((size_t)head * tokens + offsets[sequence]) * 64;
+        float *o = out + (token_major ? ((size_t)offsets[sequence] * heads + head) * 64 : base);
         float *kt = scratch + (size_t)omp_get_thread_num() * per_worker, *scores = kt + 64 * ld;
         for (int start = 0; start < length; start += tile)
-            tile_attention(q + base, k + base, v + base, out + base, kt, scores, length, start,
+            tile_attention(q + base, k + base, v + base, o, ldo, kt, scores, length, start,
                            length - start < tile ? length - start : tile, half);
     }
     return 0;

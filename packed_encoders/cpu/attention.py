@@ -39,7 +39,7 @@ def _library():
 
 def _signatures(library):
     fn = library.pe_local_attention
-    fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p, ctypes.c_size_t]
+    fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 7 + [ctypes.c_void_p, ctypes.c_size_t]
     fn.restype = ctypes.c_int
     rope = library.pe_rope_layout
     rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
@@ -92,6 +92,20 @@ def _x86_library():
         raise PackedEncodersError("native x86 CPU kernels need gcc with OpenMP") from exc
 
 
+class ResolvedNorm:
+    """A norm module resolved once for add_norm. A plain affine LayerNorm also keeps aliases of
+    its parameters: they share the module's storage, so in-place updates are read, while
+    pointers handed to native code stay valid whatever later happens to the module."""
+
+    __slots__ = ("module", "weight", "bias", "eps")
+
+    def __init__(self, norm):
+        self.module, self.weight, self.bias, self.eps = norm, None, None, None
+        if type(norm) is nn.LayerNorm and norm.weight is not None and "forward" not in norm.__dict__:
+            self.weight, self.eps = norm.weight.detach(), norm.eps
+            self.bias = None if norm.bias is None else norm.bias.detach()
+
+
 class CPUAttention:
     """Engine-owned scratch. The caller serializes access; returned context is borrowed."""
 
@@ -128,6 +142,9 @@ class CPUAttention:
         # 128 tokens on an Apple M4 at one and eight threads; SDPA won from 256.
         # A Zen 5 agreed (native ahead through 192, SDPA from 256).
         self.native_global = self.library is not None
+        # Native attention stores token-major context for callers that ask for it, instead
+        # of a head-major result they would transpose into a copy.
+        self.token_major = self.library is not None
 
     def rope_layout(self, qkv, cos, sin, heads, dim):
         """Internal FP32 conversion; native results borrow engine-owned storage.
@@ -175,16 +192,18 @@ class CPUAttention:
     def add_norm(self, x, branch, norm, *, owned=False):
         """Residual stream ``x + branch`` and ``norm`` of it, as ``(stream, normed)``.
 
-        Both inputs are contiguous [1, tokens, hidden]. The native path updates
-        ``x`` in place (bitwise PyTorch's add) and normalizes plain LayerNorms;
-        its statistics are not bitwise PyTorch's, but FP32-accurate. Unless
-        ``owned``, the normalized result borrows engine-owned storage and the
-        caller holds the engine lock through its consumption.
+        Both inputs are contiguous [1, tokens, hidden]; ``norm`` is a module or
+        its ResolvedNorm. The native path updates ``x`` in place (bitwise
+        PyTorch's add) and normalizes plain LayerNorms; its statistics are not
+        bitwise PyTorch's, but FP32-accurate. Unless ``owned``, the normalized
+        result borrows engine-owned storage and the caller holds the engine lock
+        through its consumption.
         """
-        if (not self.fused_norm or type(norm) is not nn.LayerNorm or norm.weight is None or "forward" in norm.__dict__
-                or x.shape[2] % 32):
+        if type(norm) is not ResolvedNorm:
+            norm = ResolvedNorm(norm)
+        if not self.fused_norm or norm.weight is None or x.shape[2] % 32:
             x = x + branch
-            return x, norm(x)
+            return x, norm.module(x)
         shape = x.shape
         if owned:
             out = torch.empty(shape, dtype=torch.float32)
@@ -200,17 +219,22 @@ class CPUAttention:
             raise PackedEncodersError("native CPU residual LayerNorm failed")
         return x, out
 
-    def local(self, q, k, v, lengths, boundaries):
+    def local(self, q, k, v, lengths, boundaries, *, token_major=False):
+        """Context as head-major [1, heads, tokens, dim], or [1, tokens, heads * dim] if token_major."""
         if not self.native_local:
-            return self._sdpa(q, k, v, lengths, local=True)
-        return self._native(q, k, v, lengths, boundaries, self.half)
+            return self._layout(self._sdpa(q, k, v, lengths, local=True), token_major)
+        return self._native(q, k, v, lengths, boundaries, self.half, token_major)
 
-    def global_(self, q, k, v, lengths, boundaries):
+    def global_(self, q, k, v, lengths, boundaries, *, token_major=False):
         if self.native_global and max(lengths) <= 128:
-            return self._native(q, k, v, lengths, boundaries, max(lengths))
-        return self._sdpa(q, k, v, lengths, local=False)
+            return self._native(q, k, v, lengths, boundaries, max(lengths), token_major)
+        return self._layout(self._sdpa(q, k, v, lengths, local=False), token_major)
 
-    def _native(self, q, k, v, lengths, boundaries, half):
+    @staticmethod
+    def _layout(context, token_major):
+        return context.transpose(1, 2).flatten(2) if token_major else context
+
+    def _native(self, q, k, v, lengths, boundaries, half, token_major=False):
         # Keys within `half` positions; at least the longest length is global.
         q, k, v = (t.contiguous() for t in (q, k, v))
         _, heads, tokens, dim = q.shape
@@ -220,15 +244,18 @@ class CPUAttention:
         needed = workers * (self.tile + 64) * columns
         if self.scratch is None or self.scratch.numel() < needed:
             self.scratch = torch.empty(needed, dtype=torch.float32)
-        if self.output is None or self.output.shape != q.shape:
-            self.output = torch.empty_like(q)
+        direct = token_major and self.token_major
+        shape = (1, tokens, heads * dim) if direct else q.shape
+        if self.output is None or self.output.shape != shape:
+            self.output = torch.empty(shape, dtype=torch.float32)
         status = self.library.pe_local_attention(
             q.data_ptr(), k.data_ptr(), v.data_ptr(), self.output.data_ptr(), boundaries.data_ptr(),
-            tokens, heads, len(lengths), self.tile, half, workers, self.scratch.data_ptr(), self.scratch.numel(),
+            tokens, heads, len(lengths), self.tile, half, direct, workers, self.scratch.data_ptr(),
+            self.scratch.numel(),
         )
         if status:
             raise PackedEncodersError(f"native CPU attention failed: {status}")
-        return self.output
+        return self.output if direct or not token_major else self._layout(self.output, True)
 
     def _sdpa(self, q, k, v, lengths, *, local):
         out = torch.empty_like(q)

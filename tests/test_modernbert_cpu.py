@@ -115,36 +115,67 @@ def test_fallbacks_and_live_weight_updates(model):
         with torch.autocast("cpu", dtype=torch.bfloat16):
             torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state,
                                        original(ids, attention_mask=mask).last_hidden_state)
-    model.layers[0].mlp.Wo.weight = torch.nn.Parameter(model.layers[0].mlp.Wo.weight.clone())
-    with pytest.raises(PackedEncodersError, match="repack"):
-        model(ids)
 
 
-@pytest.mark.parametrize("change", ["parameter", "storage", "submodule", "forward_hook", "pre_hook", "config"])
 @torch.no_grad()
-def test_structural_changes_require_repack(model, change):
+def test_mask_paths(model, monkeypatch):
+    ids = torch.arange(3 * 9).reshape(3, 9) % 61 + 3
+    pe.pack(model)
+    engine = pe.get_engine(model)
+    delegated = []
+    hf = engine.original_forward
+    monkeypatch.setattr(engine, "original_forward", lambda *a, **k: delegated.append(1) or hf(*a, **k))
+    # Unpadded and right-padded rows take the fast path, any other contiguous rows the
+    # general one; both give the same bits.
+    right = torch.arange(9)[None] < torch.tensor([[9], [4], [1]])
+    for mask in (None, torch.ones(3, 9, dtype=torch.long), right, right.long(), right.flip(1), right[1:2]):
+        rows = ids[:len(mask)] if mask is not None else ids
+        outputs = []
+        for fast in (True, False):
+            engine.fast_masks = fast
+            outputs.append(model(rows, attention_mask=mask).last_hidden_state)
+        torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+        assert mask is None or not outputs[0][~mask.bool()].any()
+    assert not delegated
+    # Values other than 0/1, and empty rows, delegate to HF on both paths.
+    for mask in (right.long() * 2, right & torch.tensor([[False], [True], [True]])):
+        for fast in (True, False):
+            engine.fast_masks = fast
+            model(ids, attention_mask=mask)
+    assert len(delegated) == 4
+
+
+@pytest.mark.parametrize("change", ["parameter", "storage", "dtype", "submodule", "forward_hook", "pre_hook",
+                                    "config"])
+@torch.no_grad()
+def test_structural_changes_are_not_tracked(model, change):
+    # Such changes need a repack. Until then the engine keeps computing with the tensors it
+    # resolved at packing, so a swapped or freed storage never reaches native code.
     ids, mask = inputs()
-    pe.pack(model, attention_backend="sdpa")
+    pe.pack(model)
     # Hooks on the patched root still run around the packed forward.
     calls = []
     model.register_forward_hook(lambda *args: calls.append(1))
-    model(ids, attention_mask=mask)
+    before = model(ids, attention_mask=mask).last_hidden_state
     assert calls
-    mlp = model.layers[1].mlp
+    layer = model.layers[1]
     if change == "parameter":
-        mlp.Wo.weight = torch.nn.Parameter(mlp.Wo.weight.clone())
+        layer.mlp.Wo.weight = torch.nn.Parameter(layer.mlp.Wo.weight * 2)
     elif change == "storage":
-        mlp.Wo.weight.data = mlp.Wo.weight.data.clone()
+        layer.mlp.Wo.weight.data = layer.mlp.Wo.weight.data * 2
+        layer.mlp_norm.weight.data = layer.mlp_norm.weight.data * 2
+    elif change == "dtype":
+        layer.mlp_norm.double()
     elif change == "submodule":
-        mlp.Wo = torch.nn.Linear(mlp.Wo.in_features, mlp.Wo.out_features, bias=False)
+        layer.mlp.Wo = torch.nn.Linear(layer.mlp.Wo.in_features, layer.mlp.Wo.out_features, bias=False)
     elif change == "forward_hook":
-        model.layers[1].attn.register_forward_hook(lambda *args: None)
+        layer.attn.register_forward_hook(lambda *args: calls.append(2))
     elif change == "pre_hook":
-        model.layers[1].mlp_norm.register_forward_pre_hook(lambda *args: None)
+        layer.mlp_norm.register_forward_pre_hook(lambda *args: calls.append(2))
     else:
         model.config.local_attention = 64
-    with pytest.raises(PackedEncodersError, match="repack"):
-        model(ids, attention_mask=mask)
+    torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state, before, atol=0, rtol=0)
+    assert 2 not in calls
 
 
 def test_failed_validation_restores_model(model, monkeypatch):
@@ -207,8 +238,12 @@ def test_native_local_attention():
     for threads in (1, 3):
         attention = CPUAttention("native", 64, 64, threads)
         expected = attention._sdpa(q, k, v, lengths, local=True)
-        actual = attention.local(q, k, v, lengths, boundaries)
+        actual = attention.local(q, k, v, lengths, boundaries).clone()
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        # Token-major context is the same values stored for the next projection.
+        token_major = attention.local(q, k, v, lengths, boundaries, token_major=True)
+        assert token_major is attention.output and token_major.shape == (1, sum(lengths), 3 * 64)
+        torch.testing.assert_close(token_major, actual.transpose(1, 2).flatten(2), atol=0, rtol=0)
         attention.close()
 
 
@@ -291,6 +326,13 @@ def test_native_global_attention():
             actual = attention.global_(q, k, v, lengths, boundaries)
             assert (actual is attention.output) == (max(lengths) <= 128)
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+            actual = actual.clone()
+            for direct in (True, False):  # native token-major stores, or a transposed copy
+                attention.token_major = direct
+                token_major = attention.global_(q, k, v, lengths, boundaries, token_major=True)
+                assert token_major.shape == (1, sum(lengths), 3 * 64) and token_major.is_contiguous()
+                assert (token_major is attention.output) == (direct and max(lengths) <= 128)
+                torch.testing.assert_close(token_major, actual.transpose(1, 2).flatten(2), atol=0, rtol=0)
             attention.close()
 
 
@@ -308,12 +350,12 @@ def test_native_global_full_model(model):
     assert not actual[~mask].any()
 
 
-def _sme2():
-    from packed_encoders.cpu.int8 import sme2_available
-    return sme2_available()
+def _int8():
+    from packed_encoders.cpu.int8 import sme2_available, vnni_available
+    return sme2_available() or vnni_available()
 
 
-sme2 = pytest.mark.skipif(not _sme2(), reason="Apple SME2")
+int8_kernels = pytest.mark.skipif(not _int8(), reason="Apple SME2 or x86 AVX512-VNNI")
 
 
 def scale_projections(model, factor=4.):
@@ -325,25 +367,42 @@ def scale_projections(model, factor=4.):
                 linear.weight.mul_(factor)
 
 
-def emulate_int8(engine, ids, lengths, positions):
+def emulate_int8(engine, ids, lengths, positions, kernel_quantize=False):
     """The engine's FP32 loop with every projection replaced by the int8 scheme in float64:
-    rotate, quantize per row, multiply the prepared integer weights, dequantize."""
-    from packed_encoders.cpu.int8 import rotation
+    rotate, quantize per row, multiply the prepared integer weights, dequantize. With
+    kernel_quantize, the kernel's own FP32 rotate + quantize and FP32 dequantization replace the
+    float64 ones, so only the pipeline around them is emulated: the results should be exact.
+    Otherwise FP32 rounding flips a few int8 values (each moving the output ~1e-3)."""
+    from packed_encoders.cpu.int8 import rotation, vnni_available
     q8, g = engine.int8, engine.int8.geometry
     hidden, width = rotation(g.hidden, g.block_hidden), rotation(g.width, g.block_width)
     rotations = (hidden, None, hidden, width)  # the context arrives rotated through Wv
+    signs = ((q8.signs[0], g.block_hidden), (None, 0), (q8.signs[0], g.block_hidden), (q8.signs[1], g.block_width))
     index = {id(weight): divmod(n, 4) for n, weight in enumerate(q8.weights)}
+
+    def quantize(rows, kind):
+        (s, block), (m, k) = signs[kind], rows.shape
+        blocks = (m + 15) // 16
+        out, scale, tmp = torch.empty(blocks * 16 * k, dtype=torch.int8), torch.empty(m), torch.empty(k)
+        q8.library.pe_q8_quantize(rows.data_ptr(), m, k, None if s is None else s.data_ptr(), block,
+                                  tmp.data_ptr(), out.data_ptr(), scale.data_ptr())
+        if vnni_available():  # u8 rows
+            return out.view(torch.uint8)[:m * k].view(m, k).double() - 128, scale
+        return out.view(blocks, k // 4, 16, 4).transpose(1, 2).reshape(blocks * 16, k)[:m].double(), scale
 
     def linear(x, weight, bias=None):
         layer, kind = index[id(weight)]
-        packed, scales = q8.prepared[kind]
+        packed, scales, _ = q8.prepared[kind]
         n, k = weight.shape
+        w = packed[layer].transpose(-3, -2).reshape(n, k).double()
+        if kernel_quantize:
+            q, scale = quantize(x.reshape(-1, k).contiguous(), kind)
+            return ((q @ w.T).float() * (scales[layer] * scale[:, None])).reshape(*x.shape[:-1], n)
         rows = x.reshape(-1, k).double()
         if rotations[kind] is not None:
             rows = rows @ rotations[kind]
         amax = rows.abs().amax(1, keepdim=True).clamp_min(1e-30)
         q = torch.round(rows * 127 / amax).clamp(-127, 127)
-        w = packed[layer].transpose(-3, -2).reshape(n, k).double()
         return ((q @ w.T) * (amax / 127) * scales[layer].double()).float().reshape(*x.shape[:-1], n)
 
     return engine._core(ids, lengths, positions, linear=linear)
@@ -356,8 +415,9 @@ def test_precision_option(model, monkeypatch):
     reference = model(ids, attention_mask=mask).last_hidden_state[mask]
     with pytest.raises(PackedEncodersError, match="precision"):
         pe.pack(model, precision="int4")
-    # Machines without SME2 (M1-M3, other CPUs) or a compiler for it warn and stay FP32.
+    # Machines without SME2 (M1-M3) or AVX512-VNNI, or a compiler for them, warn and stay FP32.
     monkeypatch.setattr(int8, "sme2_available", lambda: False)
+    monkeypatch.setattr(int8, "vnni_available", lambda: False)
     with pytest.warns(UserWarning, match="SME2.*using exact FP32"):
         pe.pack(model, precision="int8", attention_backend="sdpa")
     engine = pe.get_engine(model)
@@ -367,6 +427,7 @@ def test_precision_option(model, monkeypatch):
     pe.pack(model, precision="fp32")
     pe.unpack(model)
     monkeypatch.setattr(int8, "sme2_available", lambda: True)
+    monkeypatch.setattr(int8, "vnni_available", lambda: False)
     monkeypatch.setattr(int8, "library", lambda: (_ for _ in ()).throw(int8.Int8Unavailable("no compiler")))
     with pytest.warns(UserWarning, match="no compiler; using exact FP32"):
         pe.pack(model, precision="int8", attention_backend="sdpa")
@@ -377,22 +438,29 @@ def test_precision_option(model, monkeypatch):
         pe.pack(model, precision="int8")
 
 
-@sme2
+@int8_kernels
 @torch.no_grad()
 def test_int8_kernels():
-    from packed_encoders.cpu.int8 import library, pack_weights, rotation, signs
+    from packed_encoders.cpu.int8 import library, pack_weights, rotation, signs, vnni_available
     lib, _ = library()
+    x86 = vnni_available()
     rng = torch.Generator().manual_seed(3)
-    # 7 and 16 rows take the single-block kernel; 45 rows leave an odd block for 2x2 tiles.
+    # SME: 7 and 16 rows take the single-block kernel; 45 rows leave an odd block for 2x2 tiles.
+    # VNNI: 7 and 45 rows leave partial register blocks, and 8 vectors a narrower last panel.
     for m in (7, 16, 45):
         n, k, blocks = 128, 192, (m + 15) // 16
         a = torch.randint(-127, 128, (m, k), generator=rng, dtype=torch.int8)
         w = torch.randint(-127, 128, (n, k), generator=rng, dtype=torch.int8)
-        rows = torch.zeros(blocks * 16, k, dtype=torch.int8)
-        rows[:m] = a
-        packed, weights = rows.view(blocks, 16, k // 4, 4).transpose(1, 2).contiguous(), pack_weights(w)
         c = torch.empty(m, n, dtype=torch.int32)
-        lib.pe_q8_gemm(packed.data_ptr(), weights.data_ptr(), c.data_ptr(), m, n, k)
+        if x86:  # u8 = a + 128 rows: the products carry 128 * sum_k w
+            rows, weights = (a.int() + 128).to(torch.uint8), pack_weights(w, 16)
+            lib.pe_q8_gemm(rows.data_ptr(), weights.data_ptr(), c.data_ptr(), m, n, k)
+            c -= 128 * w.int().sum(1)
+        else:
+            rows = torch.zeros(blocks * 16, k, dtype=torch.int8)
+            rows[:m] = a
+            packed, weights = rows.view(blocks, 16, k // 4, 4).transpose(1, 2).contiguous(), pack_weights(w)
+            lib.pe_q8_gemm(packed.data_ptr(), weights.data_ptr(), c.data_ptr(), m, n, k)
         assert torch.equal(c.long(), a.long() @ w.long().T)
     # Per-row quantization after 128- and 64-point rotations, or none; a zero row stays zero.
     for k, block in ((256, 128), (192, 64), (192, 0)):
@@ -402,8 +470,11 @@ def test_int8_kernels():
         packed, scale, scratch = torch.full((48 * k,), 9, dtype=torch.int8), torch.empty(37), torch.empty(k)
         lib.pe_q8_quantize(x.data_ptr(), 37, k, None if s is None else s.data_ptr(), block,
                            scratch.data_ptr(), packed.data_ptr(), scale.data_ptr())
-        q = packed.view(3, k // 4, 16, 4).transpose(1, 2).reshape(48, k)
-        assert not q[37:].any()
+        if x86:  # u8 rows
+            q = packed.view(torch.uint8)[:37 * k].view(37, k).int() - 128
+        else:
+            q = packed.view(3, k // 4, 16, 4).transpose(1, 2).reshape(48, k)
+            assert not q[37:].any()
         rotated = x.double() @ rotation(k, block) if block else x.double()
         torch.testing.assert_close(scale.double(), rotated.abs().amax(1) / 127, rtol=1e-6, atol=0)
         expected = torch.round(rotated / torch.where(scale > 0, scale, 1).double()[:, None])
@@ -411,7 +482,7 @@ def test_int8_kernels():
         assert difference.max() <= 1 and (difference == 0).double().mean() > .999
 
 
-@sme2
+@int8_kernels
 @torch.no_grad()
 def test_int8_matches_its_emulation(model):
     scale_projections(model)
@@ -423,9 +494,12 @@ def test_int8_matches_its_emulation(model):
     out = model(ids, attention_mask=mask).last_hidden_state
     assert not out[~mask].any()
     relative = lambda a, b: float((a - b).norm() / b.norm())
-    # int8 is active, close to FP32, and exactly the intended scheme up to FP32 rounding.
+    # int8 is active and close to FP32; the pipeline around the kernel's rotate + quantize is
+    # exact; and the scheme is the intended float64 one up to int8 values flipped by FP32 rounding.
     assert 1e-3 < relative(out[mask], reference) < 2e-2
-    assert relative(out[mask], emulate_int8(engine, ids[mask], (7, 129), mask.nonzero()[:, 1])) < 1e-5
+    positions = mask.nonzero()[:, 1]
+    assert relative(out[mask], emulate_int8(engine, ids[mask], (7, 129), positions, kernel_quantize=True)) < 1e-6
+    assert relative(out[mask], emulate_int8(engine, ids[mask], (7, 129), positions)) < 5e-3
     saved = out.clone()
     model(ids.flip(1), attention_mask=mask)
     torch.testing.assert_close(out, saved, atol=0, rtol=0)
@@ -441,7 +515,7 @@ def test_int8_matches_its_emulation(model):
     torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state[mask], out[mask], atol=2e-5, rtol=2e-5)
 
 
-@sme2
+@int8_kernels
 def test_int8_fallbacks_and_weight_updates(model):
     ids, mask = inputs()
     ids, mask = ids[:, :8], mask[:, :8]

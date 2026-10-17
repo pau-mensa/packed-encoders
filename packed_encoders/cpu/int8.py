@@ -1,7 +1,8 @@
 """Opt-in int8 projections for the CPU ModernBERT engine (``precision="int8"``).
 
-Apple CPUs with SME2 (M4 and later) only. The four projections of every layer run as
-SME int8 outer products; attention, RoPE, GeGLU and the norms stay FP32. Each projection
+Apple CPUs with SME2 (M4 and later), and Linux x86-64 CPUs with AVX512-VNNI. The four
+projections of every layer run as SME int8 outer products or u8 x s8 VNNI dot products;
+attention, RoPE, GeGLU and the norms stay FP32. Each projection
 input is rotated by a block Hadamard transform with random signs, which the weights carry
 too, so outliers spread before rounding. The attention-output rotation is folded per head
 into Wv and Wo; the others run on the activations. Weights are quantized per output
@@ -21,8 +22,8 @@ import tempfile
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 
+from packed_encoders.cpu.attention import _openmp_runtime
 from packed_encoders.errors import PackedEncodersError, UnsupportedTargetError
 
 _P, _I, _F = ctypes.c_void_p, ctypes.c_int, ctypes.c_float
@@ -33,7 +34,7 @@ TABLES = {"full_attention": 0, "sliding_attention": 1}
 
 
 class Int8Unavailable(PackedEncodersError):
-    """This machine cannot run the int8 kernels (no SME2, or no compiler for them)."""
+    """This machine cannot run the int8 kernels (no SME2/AVX512-VNNI, or no compiler for them)."""
 
 
 class _Model(ctypes.Structure):
@@ -42,9 +43,10 @@ class _Model(ctypes.Structure):
 
 
 class _Segment(ctypes.Structure):
+    # The trailing per-channel corrections are x86's (int8_x86.c); Apple's struct ends before them.
     _fields_ = [(name, _P) for name in ("wo", "wi", "wmo", "wqkv", "so", "si", "smo", "sqkv",
                                         "mlp_weight", "mlp_bias", "after_weight", "after_bias")] + [
-        ("mlp_eps", _F), ("after_eps", _F), ("table", _I)]
+        ("mlp_eps", _F), ("after_eps", _F), ("table", _I)] + [(name, _P) for name in ("co", "ci", "cmo", "cqkv")]
 
 
 class _Buffers(ctypes.Structure):
@@ -61,22 +63,51 @@ def sme2_available():
     return status == 0 and value.value == 1
 
 
+def vnni_available():
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        return False
+    try:
+        with open("/proc/cpuinfo") as info:
+            flags = next((line.split(":", 1)[1].split() for line in info if line.startswith("flags")), [])
+    except OSError:
+        return False
+    return {"avx512f", "avx512bw", "avx512_vnni"} <= set(flags)
+
+
+def x86():
+    return platform.system() == "Linux" and platform.machine() == "x86_64"
+
+
 @lru_cache(maxsize=1)
 def library():
     # Process-private directory, as for the attention library. Streaming SME code needs
-    # an SME2 target; only this translation unit is built for it.
+    # an SME2 target; only this translation unit is built for it. On x86, gcc builds it
+    # against PyTorch's OpenMP runtime, as the attention library.
     directory = tempfile.TemporaryDirectory(prefix="packed-encoders-int8-")
-    path = Path(directory.name) / "int8.dylib"
+    here, out = Path(__file__).parent, Path(directory.name)
     try:
-        subprocess.run(
-            ["xcrun", "clang", "-O3", "-mcpu=apple-m4", "-Wall", "-Wextra", "-Werror", "-dynamiclib",
-             str(Path(__file__).with_name("int8.c")), "-o", str(path)],
-            check=True, capture_output=True, timeout=60,
-        )
-        lib = ctypes.CDLL(str(path))
+        if x86():
+            runtime = _openmp_runtime()
+            if runtime is None:
+                raise OSError("PyTorch's OpenMP runtime not found")
+            subprocess.run(
+                ["gcc", "-O3", "-march=native", "-fPIC", "-fopenmp", "-ffp-contract=off", "-fno-trapping-math",
+                 "-fno-math-errno", "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-shared",
+                 str(here / "int8_x86.c"), runtime, f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(out / "int8.so")],
+                check=True, capture_output=True, timeout=60,
+            )
+            lib = ctypes.CDLL(str(out / "int8.so"))
+        else:
+            subprocess.run(
+                ["xcrun", "clang", "-O3", "-mcpu=apple-m4", "-Wall", "-Wextra", "-Werror", "-dynamiclib",
+                 str(here / "int8.c"), "-o", str(out / "int8.dylib")],
+                check=True, capture_output=True, timeout=60,
+            )
+            lib = ctypes.CDLL(str(out / "int8.dylib"))
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
-        raise Int8Unavailable("precision='int8' needs the Xcode Command Line Tools with Apple M4 support "
+        raise Int8Unavailable("precision='int8' needs gcc with OpenMP" if x86() else
+                              "precision='int8' needs the Xcode Command Line Tools with Apple M4 support "
                               "(xcrun clang -mcpu=apple-m4)") from exc
     for name in ("pe_q8_input", "pe_q8_segment"):
         fn = getattr(lib, name)
@@ -99,10 +130,11 @@ def rotation(k, block):
     return torch.block_diag(*[h / block ** .5] * (k // block)) * signs(k, block)[:, None]
 
 
-def pack_weights(q):
-    """[..., N, K] int8 -> the SMOPA layout [..., N/64, K/4, 64, 4]."""
+def pack_weights(q, lanes=64):
+    """[..., N, K] int8 -> [..., N/lanes, K/4, lanes, 4]: the SMOPA layout (64 lanes) or one
+    VNNI vector of 16 channels x 4 k (16 lanes)."""
     *lead, n, k = q.shape
-    return q.reshape(*lead, n // 64, 64, k // 4, 4).transpose(-3, -2).contiguous()
+    return q.reshape(*lead, n // lanes, lanes, k // 4, 4).transpose(-3, -2).contiguous()
 
 
 def gptq(weights, hessians, block=128, damp=0.01):
@@ -166,19 +198,26 @@ class Int8Projections:
     def __init__(self, engine):
         cfg, layers = engine.model.config, engine.layers
         hidden, heads, width = engine.hidden, engine.heads, cfg.intermediate_size
-        if not sme2_available():
-            raise Int8Unavailable("precision='int8' needs an Apple CPU with SME2 (M4 or later)")
+        self.x86 = vnni_available()
+        if not (self.x86 or sme2_available()):
+            raise Int8Unavailable("precision='int8' needs an Apple CPU with SME2 (M4 or later) "
+                                  "or an x86 CPU with AVX512-VNNI")
         if engine.dim != 64 or hidden % 64 or width % 64:
             raise UnsupportedTargetError("CPU int8 requires head_dim=64 and hidden/intermediate sizes divisible by 64")
-        norms = [layer.mlp_norm for layer in layers] + [layer.attn_norm for layer in layers[1:]] + [engine.model.final_norm]
-        if any(type(norm) is not nn.LayerNorm or norm.weight is None or "forward" in norm.__dict__ for norm in norms):
+        # Each layer's MLP norm and the norm after it (the next attention norm, then the final
+        # norm), resolved by the engine: the segments point into their aliases, which keep that
+        # storage alive whatever later happens to the modules.
+        norms = [layer[5:7] for layer in engine.plan]
+        if any(norm.weight is None for pair in norms for norm in pair):
             raise UnsupportedTargetError("CPU int8 requires plain affine LayerNorms after layer 0")
         linears = [(layer.attn.Wqkv, layer.attn.Wo, layer.mlp.Wi, layer.mlp.Wo) for layer in layers]
         if any(linear.bias is not None for linear in sum(linears, ())):
             raise UnsupportedTargetError("CPU int8 requires bias-free projections")
         self.library, _ = library()
         self.engine, self.workers = engine, engine.attention.threads
-        self.weights = [linear.weight for linear in sum(linears, ())]
+        # The engine's aliases: _core passes these to calibration, and they share the
+        # parameters' version counters.
+        self.weights = [weight for layer in engine.plan for weight, _ in layer[1:5]]
         block_hidden, block_width = (128 if hidden % 128 == 0 else 64), (128 if width % 128 == 0 else 64)
         r_hidden, r_width, r_heads = rotation(hidden, block_hidden), rotation(width, block_width), rotation(hidden, 64)
         grams = _calibrate(engine, self.weights)
@@ -197,25 +236,29 @@ class Int8Projections:
                 stack.append((w @ a).float())
                 hessians.append(a.T @ grams[4 * index + kind] @ a)
             q, scale = gptq(torch.stack(stack), torch.stack(hessians))
-            self.prepared.append((pack_weights(q), scale.contiguous()))
+            # x86 multiplies u8 = q + 128 activations: its products carry 128 * sum_k w[n][k].
+            correction = (128 * q.sum(-1, dtype=torch.int32)).contiguous() if self.x86 else None
+            self.prepared.append((pack_weights(q, 16 if self.x86 else 64), scale.contiguous(), correction))
         self.signs = (signs(hidden, block_hidden).float(), signs(width, block_width).float())
         self.geometry = _Model(hidden, heads, width, block_hidden, block_width,
                             self.signs[0].data_ptr(), self.signs[1].data_ptr())
-        (qkv, s_qkv), (o, s_o), (i, s_i), (mo, s_mo) = self.prepared
+        (qkv, s_qkv, c_qkv), (o, s_o, c_o), (i, s_i, c_i), (mo, s_mo, c_mo) = self.prepared
         kinds = [TABLES[kind] for kind in engine.kinds]
-        following = [*(layer.attn_norm for layer in layers[1:]), engine.model.final_norm]
-        self.first = _Segment(wqkv=qkv[0].data_ptr(), sqkv=s_qkv[0].data_ptr(), table=kinds[0])
+        pointer = (lambda t, n: t[n].data_ptr()) if self.x86 else (lambda t, n: None)
+        self.first = _Segment(wqkv=qkv[0].data_ptr(), sqkv=s_qkv[0].data_ptr(), table=kinds[0],
+                              cqkv=pointer(c_qkv, 0))
         self.segments = []
-        for n, (layer, after) in enumerate(zip(layers, following)):
+        for n, (norm, after) in enumerate(norms):
             last = n + 1 == len(layers)
-            norm = layer.mlp_norm
             self.segments.append(_Segment(
                 wo=o[n].data_ptr(), wi=i[n].data_ptr(), wmo=mo[n].data_ptr(), wqkv=None if last else qkv[n + 1].data_ptr(),
                 so=s_o[n].data_ptr(), si=s_i[n].data_ptr(), smo=s_mo[n].data_ptr(),
                 sqkv=None if last else s_qkv[n + 1].data_ptr(),
                 mlp_weight=norm.weight.data_ptr(), mlp_bias=None if norm.bias is None else norm.bias.data_ptr(),
                 after_weight=after.weight.data_ptr(), after_bias=None if after.bias is None else after.bias.data_ptr(),
-                mlp_eps=norm.eps, after_eps=after.eps, table=0 if last else kinds[n + 1]))
+                mlp_eps=norm.eps, after_eps=after.eps, table=0 if last else kinds[n + 1],
+                co=pointer(c_o, n), ci=pointer(c_i, n), cmo=pointer(c_mo, n),
+                cqkv=None if last else pointer(c_qkv, n + 1)))
         self.versions = list(map(_version, self.weights))
         per_worker = max(3 * hidden, 4 * width)
         self.scratch = torch.empty(self.workers * per_worker)
@@ -260,8 +303,9 @@ class Int8Projections:
             raise PackedEncodersError("native CPU int8 input projection failed")
         for kind, segment in zip(engine.kinds, self.segments):
             q, k, v = rope.unbind(0)
-            context = (engine.attention.local(q, k, v, lengths, boundaries) if kind == "sliding_attention"
-                       else engine.attention.global_(q, k, v, lengths, boundaries)).contiguous()
+            # x86 segments read token-major context; Apple's gather heads from head-major.
+            attention = engine.attention.local if kind == "sliding_attention" else engine.attention.global_
+            context = attention(q, k, v, lengths, boundaries, token_major=self.x86).contiguous()
             if self.library.pe_q8_segment(model, ctypes.addressof(segment), buffers, context.data_ptr(),
                                           tokens, self.workers):
                 raise PackedEncodersError("native CPU int8 layer failed")

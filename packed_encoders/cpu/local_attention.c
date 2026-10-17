@@ -1,5 +1,6 @@
 // FP32 ModernBERT local attention for Apple CPUs. No fast-math.
-// Q/K/V/output: contiguous [heads, total_tokens, 64]. Lengths delimit sequences.
+// Q/K/V: contiguous [heads, total_tokens, 64]; output the same, or token-major
+// [total_tokens, heads * 64] (the next projection's input layout). Lengths delimit sequences.
 // Queries attend keys within `half` positions in their sequence; a half-width of
 // at least the longest sequence gives exact global attention.
 // Build: clang -O3 -dynamiclib -framework Accelerate modernbert_local_attention.c -o attention.dylib
@@ -15,7 +16,7 @@ typedef struct {
     const float *q, *k, *v;
     float *out, *scratch;
     const int *lengths;
-    int tokens, heads, sequences, tile, half, columns, workers;
+    int tokens, heads, sequences, tile, half, columns, workers, token_major;
 } Context;
 
 static void worker(void *opaque, size_t worker_id) {
@@ -27,6 +28,9 @@ static void worker(void *opaque, size_t worker_id) {
         int offset = 0, length = c->lengths[sequence];
         for (int i = 0; i < sequence; ++i) offset += c->lengths[i];
         size_t base = ((size_t)head * c->tokens + offset) * dim;
+        // Output rows ldo apart from this head and sequence's first token.
+        int ldo = c->token_major ? c->heads * dim : dim;
+        float *o = c->out + (c->token_major ? ((size_t)offset * c->heads + head) * dim : base);
         for (int start = 0; start < length; start += c->tile) {
             int rows = length - start < c->tile ? length - start : c->tile;
             int lo = start > half ? start - half : 0;
@@ -61,14 +65,14 @@ static void worker(void *opaque, size_t worker_id) {
             }
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, rows, dim, cols,
                         1.f, scores, cols, c->v + base + lo * dim, dim, 0.f,
-                        c->out + base + start * dim, dim);
+                        o + (size_t)start * ldo, ldo);
         }
     }
 }
 
 int pe_local_attention(const float *q, const float *k, const float *v,
                        float *out, const int *lengths, int tokens,
-                       int heads, int sequences, int tile, int half, int workers,
+                       int heads, int sequences, int tile, int half, int token_major, int workers,
                        float *scratch, size_t scratch_floats) {
     if (tokens < 1 || heads < 1 || sequences < 1 || tile < 1 || tile > 4096 || half < 0 || workers < 1)
         return -1;
@@ -85,7 +89,8 @@ int pe_local_attention(const float *q, const float *k, const float *v,
     int columns = tile + 2 * half < longest ? tile + 2 * half : longest;
     if (workers > heads * sequences) workers = heads * sequences;
     if (!scratch || scratch_floats < (size_t)workers * tile * columns) return -2;
-    Context context = {q, k, v, out, scratch, lengths, tokens, heads, sequences, tile, half, columns, workers};
+    Context context = {q, k, v, out, scratch, lengths, tokens, heads, sequences, tile, half, columns, workers,
+                       token_major};
     if (workers == 1) worker(&context, 0);
     else dispatch_apply_f(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &context, worker);
     return 0;

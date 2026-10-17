@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
-from itertools import chain
-from operator import attrgetter, is_not
 import threading
 from types import SimpleNamespace
 import warnings
@@ -16,17 +13,18 @@ from torch import nn
 
 from packed_encoders.batch import PackedBatch
 from packed_encoders.config import _rope_thetas
-from packed_encoders.cpu.attention import CPUAttention
+from packed_encoders.cpu.attention import CPUAttention, ResolvedNorm
 from packed_encoders.engine import Capabilities, ModelBinding, ValidationResult
 from packed_encoders.errors import PackedEncodersError, UnsupportedTargetError, ValidationError
 from packed_encoders.locate import is_modernbert_encoder
 from packed_encoders.state import ATTR
 
-_present = partial(is_not, None)
-_layout = attrgetter("dtype", "device", "shape")
-_training = attrgetter("training")
 # Pack-time gate for precision="int8" against the FP32 HF forward (see validate()).
 INT8_MEDIAN_COSINE, INT8_RELATIVE_L2 = 0.99, 0.25
+
+
+def _alias(tensor):
+    return None if tensor is None else tensor.detach()
 
 
 def _forward_hooks(module):
@@ -150,22 +148,25 @@ class PackedModernBertCPU:
             for projection in (layer.attn.Wqkv, layer.attn.Wo, layer.mlp.Wi, layer.mlp.Wo):
                 if type(projection) is not nn.Linear or "forward" in projection.__dict__:
                     raise UnsupportedTargetError("CPU projections must be plain nn.Linear modules; merge adapters first")
-        # Snapshot each module's registries once. Requests compare them with
-        # C-level maps (~0.1 ms) instead of re-walking the module tree (~0.4 ms);
-        # identical children for every module from the root mean an identical tree.
-        self._modules = tuple(self.model.modules())
-        self._children = tuple(m._modules for m in self._modules)
-        self._owned = tuple(m._parameters for m in self._modules)
-        # Root hooks still run around the replaced forward; internal ones would be bypassed.
-        self._hook_dicts = tuple(chain.from_iterable(
-            (m._forward_hooks, m._forward_pre_hooks) for m in self._modules[1:]))
-        self._structure = self._structure_signature()
-        self._hook_keys, self._hooks = self._raw_hooks(), self._hook_signature()
         for param in self.model.parameters():
             if param.device.type != "cpu" or param.dtype != torch.float32 or not param.is_contiguous():
                 raise UnsupportedTargetError("CPU ModernBERT requires contiguous FP32 CPU parameters")
-        self._configuration = self._config_signature()
         self.attention = CPUAttention(backend, self.dim, self.half, engine.threads or torch.get_num_threads())
+        # What _core reads per layer, resolved once: the attention kind, (weight, bias) aliases
+        # of the four projections, the two norms it applies, and whether the second is the final
+        # norm. Aliases share the parameters' storage, so in-place updates are read. Requests
+        # never re-walk the module tree (a cold walk cost ~0.3 ms per call): other changes after
+        # packing (replaced parameters or modules, .data swaps, device/dtype moves, internal
+        # hooks, config edits) need a repack and go undetected, but never reach native code as
+        # stale pointers.
+        following = (*(layer.attn_norm for layer in self.layers[1:]), self.model.final_norm)
+        self.plan = tuple(
+            (kind, *((_alias(p.weight), _alias(p.bias)) for p in (layer.attn.Wqkv, layer.attn.Wo, layer.mlp.Wi,
+                                                                   layer.mlp.Wo)),
+             ResolvedNorm(layer.mlp_norm), ResolvedNorm(after), after is self.model.final_norm)
+            for layer, kind, after in zip(self.layers, self.kinds, following))
+        # Private ablation switch: the fast path for unpadded/right-padded masks.
+        self.fast_masks = True
         self.state = SimpleNamespace(attention_backend=self.attention.backend, validation_report=None,
                                      precision="fp32")
         self.tables = {}
@@ -186,40 +187,9 @@ class PackedModernBertCPU:
                 warnings.warn(f"{exc}; using exact FP32", stacklevel=4)
         self.precision = self.state.precision = "fp32" if self.int8 is None else "int8"
 
-    def _structure_signature(self):
-        # Child modules and parameter objects by identity, plus parameter storage,
-        # dtype, device, shape and strides. In-place value updates stay allowed.
-        params = list(filter(_present, chain.from_iterable(map(dict.values, self._owned))))
-        return (list(map(list, map(dict.items, self._children))), list(map(list, self._owned)),
-                list(map(id, params)), list(map(torch.Tensor.data_ptr, params)),
-                list(map(_layout, params)), list(map(torch.Tensor.stride, params)))
-
-    def _raw_hooks(self):
-        return list(map(list, self._hook_dicts))
-
-    def _hook_signature(self):
-        return [(_forward_hooks(m), tuple(m._forward_pre_hooks)) for m in self._modules[1:]]
-
-    def _config_signature(self):
-        cfg = self.model.config
-        return (cfg.hidden_size, cfg.num_attention_heads, cfg.local_attention,
-                cfg.max_position_embeddings, repr(getattr(cfg, "layer_types", None)),
-                getattr(cfg, "global_attn_every_n_layers", None), repr(getattr(cfg, "rope_parameters", None)),
-                _rope_thetas(cfg), cfg.hidden_activation)
-
     def _check(self):
         if self._closed:
             raise PackedEncodersError("this CPU engine has been closed; pack the model again")
-        changed = self._structure != self._structure_signature() or self._configuration != self._config_signature()
-        if not changed:
-            hooks = self._raw_hooks()
-            if hooks != self._hook_keys:
-                # Permitted output-capturing hooks may be added; any other hook fails.
-                changed = self._hooks != self._hook_signature()
-                if not changed:
-                    self._hook_keys = hooks
-        if changed:
-            raise PackedEncodersError("CPU model structure/storage/device/dtype changed; unpack and repack")
 
     @property
     def graph_enabled(self):
@@ -257,34 +227,17 @@ class PackedModernBertCPU:
             extra_outputs = any(kwargs.get(key) if kwargs.get(key) is not None else getattr(cfg, key, False)
                                 for key in ("output_hidden_states", "output_attentions"))
             token_types = kwargs.get("token_type_ids")
-            fallback = (args or unsupported or extra_outputs or any(map(_training, self._modules)) or torch.is_grad_enabled()
+            fallback = (args or unsupported or extra_outputs or self.model.training or torch.is_grad_enabled()
                         or torch.is_autocast_enabled("cpu") or input_ids is None
                         or (token_types is not None and bool(token_types.any())))
             if fallback:
                 return self.original_forward(input_ids, attention_mask, *args, **kwargs)
             self._ids(input_ids, ndim=2)
-            b, s = input_ids.shape
-            if attention_mask is None:
-                mask = torch.ones_like(input_ids, dtype=torch.bool)
-            elif (attention_mask.device.type != "cpu" or attention_mask.shape != input_ids.shape
-                  or not bool(((attention_mask == 0) | (attention_mask == 1)).all())):
-                return self.original_forward(input_ids, attention_mask, **kwargs)
-            else:
-                mask = attention_mask.bool()
-            lengths = tuple(mask.sum(1).tolist())
-            # Compaction must preserve local-window distances. Holey or empty
-            # rows delegate to HF; left/right padding preserves column RoPE.
-            columns = torch.arange(s).expand(b, s)
-            starts = columns.masked_fill(~mask, s).amin(1)
-            ends = columns.masked_fill(~mask, -1).amax(1)
-            if not all(lengths) or not torch.equal(ends - starts + 1, mask.sum(1)):
-                return self.original_forward(input_ids, attention_mask, **kwargs)
-            indices = mask.flatten().nonzero().flatten()
-            ids = input_ids.flatten()[indices]
-            hidden = self._packed(ids, lengths, indices % s)
-            out = hidden.new_zeros(b * s, self.hidden)
-            out.index_copy_(0, indices, hidden)
-            out = out.view(b, s, self.hidden)
+            out = self._prefixes(input_ids, attention_mask) if self.fast_masks else None
+            if out is None:
+                out = self._compacted(input_ids, attention_mask)
+                if out is None:
+                    return self.original_forward(input_ids, attention_mask, **kwargs)
             return_dict = kwargs.get("return_dict")
             if return_dict is None:
                 return_dict = getattr(cfg, "return_dict", True)
@@ -292,6 +245,54 @@ class PackedModernBertCPU:
                 return (out,)
             from transformers.modeling_outputs import BaseModelOutput
             return BaseModelOutput(last_hidden_state=out)
+
+    def _prefixes(self, input_ids, attention_mask):
+        """The padded output when every row is a nonempty prefix (unpadded or right-padded
+        rows), else None for the general path. Equality with a boolean prefix also rejects
+        values other than 0/1."""
+        b, s = input_ids.shape
+        columns = torch.arange(s)
+        if attention_mask is not None:
+            if attention_mask.device.type != "cpu" or attention_mask.shape != input_ids.shape:
+                return None
+            counts = attention_mask.sum(1)
+            prefix = columns < counts[:, None]
+            if not bool((attention_mask == prefix).all()):
+                return None
+            lengths = tuple(counts.tolist())
+            if not all(lengths):
+                return None
+        if attention_mask is None or all(n == s for n in lengths):
+            return self._packed(input_ids.reshape(-1), (s,) * b, columns.repeat(b) if b > 1 else columns).view(b, s, -1)
+        hidden = self._packed(input_ids[prefix], lengths, columns.expand(b, s)[prefix])
+        out = hidden.new_zeros(b, s, self.hidden)
+        out[prefix] = hidden
+        return out
+
+    def _compacted(self, input_ids, attention_mask):
+        """The padded output for any 0/1 mask, or None to delegate to HF."""
+        b, s = input_ids.shape
+        if attention_mask is None:
+            mask = torch.ones_like(input_ids, dtype=torch.bool)
+        elif (attention_mask.device.type != "cpu" or attention_mask.shape != input_ids.shape
+              or not bool(((attention_mask == 0) | (attention_mask == 1)).all())):
+            return None
+        else:
+            mask = attention_mask.bool()
+        lengths = tuple(mask.sum(1).tolist())
+        # Compaction must preserve local-window distances. Holey or empty
+        # rows delegate to HF; left/right padding preserves column RoPE.
+        columns = torch.arange(s).expand(b, s)
+        starts = columns.masked_fill(~mask, s).amin(1)
+        ends = columns.masked_fill(~mask, -1).amax(1)
+        if not all(lengths) or not torch.equal(ends - starts + 1, mask.sum(1)):
+            return None
+        indices = mask.flatten().nonzero().flatten()
+        ids = input_ids.flatten()[indices]
+        hidden = self._packed(ids, lengths, indices % s)
+        out = hidden.new_zeros(b * s, self.hidden)
+        out.index_copy_(0, indices, hidden)
+        return out.view(b, s, self.hidden)
 
     def _ids(self, ids, *, ndim):
         if ids.device.type != "cpu" or ids.dtype != torch.int64 or ids.ndim != ndim or not ids.numel():
@@ -302,7 +303,7 @@ class PackedModernBertCPU:
     def forward_packed(self, batch: PackedBatch):
         with self._lock:
             self._check()
-            if any(map(_training, self._modules)) or torch.is_grad_enabled() or torch.is_autocast_enabled("cpu"):
+            if self.model.training or torch.is_grad_enabled() or torch.is_autocast_enabled("cpu"):
                 raise PackedEncodersError("CPU forward_packed requires eval(), no_grad/inference_mode, and no CPU autocast")
             self._ids(batch.input_ids, ndim=1)
             lengths = batch.host_lengths
@@ -347,22 +348,17 @@ class PackedModernBertCPU:
         boundaries = torch.tensor(lengths, dtype=torch.int32)
         x = self.model.embeddings(ids[None])
         normed = self.layers[0].attn_norm(x)
+        cpu = self.attention
         # Each residual add feeds the next norm: this layer's MLP norm, then the
         # next layer's attention norm or the final norm.
-        final = self.model.final_norm
-        following = (*(layer.attn_norm for layer in self.layers[1:]), final)
-        for layer, kind, after in zip(self.layers, self.kinds, following):
-            qkv = linear(normed, layer.attn.Wqkv.weight, layer.attn.Wqkv.bias)
+        for kind, (wqkv, bqkv), (wo, bo), (wi, bi), (wmo, bmo), mlp_norm, after, final in self.plan:
+            qkv = linear(normed, wqkv, bqkv)
             cos, sin = tables[kind]
-            q, k, v = self.attention.rope_layout(qkv, cos, sin, self.heads, self.dim)
-            context = (self.attention.local(q, k, v, lengths, boundaries) if kind == "sliding_attention"
-                       else self.attention.global_(q, k, v, lengths, boundaries))
-            context = context.transpose(1, 2).reshape_as(x)
-            x, normed = self.attention.add_norm(x, linear(context, layer.attn.Wo.weight, layer.attn.Wo.bias),
-                                                layer.mlp_norm)
-            hidden = linear(normed, layer.mlp.Wi.weight, layer.mlp.Wi.bias)
-            x, normed = self.attention.add_norm(x, linear(self.attention.geglu(hidden), layer.mlp.Wo.weight,
-                                                            layer.mlp.Wo.bias), after, owned=after is final)
+            q, k, v = cpu.rope_layout(qkv, cos, sin, self.heads, self.dim)
+            attention = cpu.local if kind == "sliding_attention" else cpu.global_
+            context = attention(q, k, v, lengths, boundaries, token_major=True)
+            x, normed = cpu.add_norm(x, linear(context, wo, bo), mlp_norm)
+            x, normed = cpu.add_norm(x, linear(cpu.geglu(linear(normed, wi, bi)), wmo, bmo), after, owned=final)
         return normed[0]
 
     def validate(self):
@@ -405,5 +401,5 @@ class PackedModernBertCPU:
                 self.int8 = None
             self.attention.close()
             self.tables.clear()
-            self.layers = ()
+            self.layers = self.plan = ()
             self._closed = True
