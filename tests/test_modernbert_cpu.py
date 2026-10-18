@@ -376,6 +376,25 @@ def test_avx2_build_keeps_native_rows_and_attention(model, monkeypatch):
 
 @native_linear
 @torch.no_grad()
+def test_pack_time_gemm_tuning(model):
+    with pytest.raises(ValueError, match="tune_gemm"):
+        pe.ModernBertCPU(tune_gemm=1)
+    ids, mask = inputs()
+    ids, mask = ids[:, :16], mask[:, :16]
+    expected = model(ids, attention_mask=mask).last_hidden_state
+    pe.pack(model, engine=pe.ModernBertCPU(threads=1, max_tokens=32, tune_gemm=True))
+    attention = pe.get_engine(model).attention
+    assert attention.linear_tuning and {key[0] for key in attention.linear_tuning} == {16, 32}
+    torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state[mask], expected[mask],
+                               atol=2e-5, rtol=2e-5)
+    pe.unpack(model)
+    assert not attention.linear_tiles and not attention.linear_tuning
+    pe.pack(model, engine=pe.ModernBertCPU(tune_gemm=True), attention_backend="sdpa")
+    assert not pe.get_engine(model).attention.linear_tuning
+
+
+@native_linear
+@torch.no_grad()
 def test_native_linear_reads_live_weights(model):
     ids, mask = inputs()
     original = model.forward

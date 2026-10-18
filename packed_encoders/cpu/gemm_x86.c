@@ -1,9 +1,9 @@
 // FP32 projections for the x86 ModernBERT CPU engine: y = x w^T (+ b) on the original row-major [N, K]
 // weights, with no reorder and no copy. x is [M, K] row-major.
 //
-// Dot-product (NT) tiles use 3 activation rows x 8 weight rows, or 4 x 6 for K=1152 to keep
-// the weights and activations within Zen 5's 48 KiB L1. Both have 24 named accumulators
-// (arrays make GCC spill), reduced horizontally at the end. Threads split the weight blocks.
+// Dot-product (NT) tiles have up to 24 named accumulators (arrays make GCC spill), reduced
+// horizontally at the end. The caller chooses a tile using the CPU cache size or pack-time
+// measurements. Threads split the weight blocks.
 // The next block's weights are prefetched during the current block, spread over its tiles.
 // Specializing K and the common prefetch counts removes address arithmetic and nested loops.
 // Four k steps are unrolled without changing any accumulator's addition order.
@@ -110,8 +110,8 @@ typedef void (*Tile)(const float *, const float *, int, const float *, float *, 
     static __attribute__((noinline)) void tile_##r##_##c(const float *x, const float *w, int K,                 \
                                                          const float *bias, float *y, int ldy,                  \
                                                          const float *const *pf, int npf) {                     \
-        if (c == 8 && K == 768) FIXED(768, r, c);                                                               \
-        else if (c == 6 && K == 1152) FIXED(1152, r, c);                                                        \
+        if ((c == 4 || c == 6 || c == 8) && K == 768) FIXED(768, r, c);                                        \
+        else if ((c == 4 || c == 6 || c == 8) && K == 1152) FIXED(1152, r, c);                                 \
         else tile(x, w, K, bias, y, ldy, pf, npf, r, c);                                                        \
     }
 #define SIX(r) SHAPE(r, 1) SHAPE(r, 2) SHAPE(r, 3) SHAPE(r, 4) SHAPE(r, 5) SHAPE(r, 6)
@@ -122,10 +122,9 @@ SHAPES(1) SHAPES(2) SHAPES(3) SIX(4)
 static const Tile TILES[ROWS][COLS] = {ROW(1), ROW(2), ROW(3),
     {tile_4_1, tile_4_2, tile_4_3, tile_4_4, tile_4_5, tile_4_6, NULL, NULL}};
 
-// All M rows against weight rows [n0, n0 + COLS), prefetching the rows from `next` on.
-static void block(const float *x, const float *w, const float *bias, float *y, int M, int N, int K, int n0,
-                  int next) {
-    int width = K == 1152 ? 6 : COLS, rows = K == 1152 ? 4 : 3;
+// All M rows against a weight block, prefetching the rows from `next` on.
+static inline __attribute__((always_inline)) void block(const float *x, const float *w, const float *bias,
+                  float *y, int M, int N, int K, int n0, int next, int rows, int width) {
     int cols = N - n0 < width ? N - n0 : width;
     int ahead = next >= N ? 0 : (N - next < width ? N - next : width);
     int tiles = (M + rows - 1) / rows;
@@ -138,12 +137,32 @@ static void block(const float *x, const float *w, const float *bias, float *y, i
     }
 }
 
-int pe_linear(const float *x, const float *w, const float *bias, float *y, int M, int N, int K, int workers) {
-    if (M < 0 || N <= 0 || K <= 0 || workers <= 0) return 1;
-    int width = K == 1152 ? 6 : COLS, blocks = (N + width - 1) / width;
-#pragma omp parallel for num_threads(workers) if (workers > 1) schedule(static)
-    for (int b = 0; b < blocks; ++b) block(x, w, bias, y, M, N, K, b * width, (b + 1) * width);
+int pe_linear_tile(const float *x, const float *w, const float *bias, float *y, int M, int N, int K,
+                   int workers, int rows, int width) {
+    if (M < 0 || N <= 0 || K <= 0 || workers <= 0 || rows < 1 || rows > ROWS || width < 1 ||
+        width > COLS || rows * width > 24) return 1;
+    int blocks = (N + width - 1) / width;
+    // Dispatch once per GEMM, keeping row/column strides constant in the hot loop.
+    // In particular, computing the prefetch spread must not divide by a runtime
+    // tile height separately for every weight block.
+#define RUN(r, c)                                                                                               \
+    do {                                                                                                        \
+        _Pragma("omp parallel for num_threads(workers) if (workers > 1) schedule(static)")                       \
+        for (int b = 0; b < blocks; ++b) block(x, w, bias, y, M, N, K, b * (c), (b + 1) * (c), r, c);             \
+    } while (0)
+    if (rows == 3 && width == 8) RUN(3, 8);
+    else if (rows == 4 && width == 6) RUN(4, 6);
+    else if (rows == 3 && width == 6) RUN(3, 6);
+    else if (rows == 3 && width == 4) RUN(3, 4);
+    else if (rows == 2 && width == 4) RUN(2, 4);
+    else RUN(rows, width);
+#undef RUN
     return 0;
+}
+
+// The previous dispatch remains available for benchmark ablations.
+int pe_linear(const float *x, const float *w, const float *bias, float *y, int M, int N, int K, int workers) {
+    return pe_linear_tile(x, w, bias, y, M, N, K, workers, K == 1152 ? 4 : 3, K == 1152 ? 6 : 8);
 }
 
 #endif

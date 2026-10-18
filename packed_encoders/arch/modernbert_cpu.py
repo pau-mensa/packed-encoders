@@ -90,18 +90,27 @@ class ModernBertCPU:
     platforms this only copies. In-place updates and state_dict keep
     working; references to the old storage taken before packing stop aliasing
     the model. Unpacking does not move them back.
+
+    Native x86 FP32 projections select register tiles using the detected L1 data
+    cache size. ``tune_gemm=True`` additionally measures candidate tiles during
+    packing, using the model's live weights at 16/32/256 tokens and the configured
+    thread count. Other lengths use cache-aware selection. Repack after changing
+    CPU affinity; tuning adds setup time and never runs during inference.
     """
     name = "modernbert-cpu"
     adapters = (CPUAdapter(),)
 
-    def __init__(self, *, threads=None, max_tokens=32768, rehome_weights=False):
+    def __init__(self, *, threads=None, max_tokens=32768, rehome_weights=False, tune_gemm=False):
         if threads is not None and (type(threads) is not int or threads <= 0):
             raise ValueError("threads must be a positive integer")
         if type(max_tokens) is not int or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
         if type(rehome_weights) is not bool:
             raise ValueError("rehome_weights must be a bool")
+        if type(tune_gemm) is not bool:
+            raise ValueError("tune_gemm must be a bool")
         self.threads, self.max_tokens, self.rehome_weights = threads, max_tokens, rehome_weights
+        self.tune_gemm = tune_gemm
 
     def prepare(self, binding, options):
         _options(options)
@@ -201,6 +210,9 @@ class PackedModernBertCPU:
             except Int8Unavailable as exc:
                 warnings.warn(f"{exc}; using exact FP32", stacklevel=4)
         self.precision = self.state.precision = "fp32" if self.int8 is None else "int8"
+        if engine.tune_gemm and self.precision == "fp32":
+            self.attention.tune_linear([projection for layer in self.plan for projection in layer[1:5]],
+                                       self.max_tokens)
 
     def _check(self):
         if self._closed:

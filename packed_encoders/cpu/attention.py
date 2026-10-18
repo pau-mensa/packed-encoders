@@ -18,6 +18,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from packed_encoders.errors import PackedEncodersError
+from packed_encoders.cpu.gemm import choose_tile, l1_data_cache_bytes, tune_tiles
 
 
 @lru_cache(maxsize=1)
@@ -95,6 +96,8 @@ def _x86_library():
         if hasattr(library, "pe_linear"):
             library.pe_linear.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4
             library.pe_linear.restype = ctypes.c_int
+            library.pe_linear_tile.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6
+            library.pe_linear_tile.restype = ctypes.c_int
         return library, directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
@@ -158,6 +161,15 @@ class CPUAttention:
         # x86 projections: MKL does not pick its AVX-512 kernels on AMD; the native GEMM reads the
         # original weights (Apple keeps Accelerate through F.linear).
         self.native_linear = self.rows is not None and x86 and hasattr(self.rows, "pe_linear")
+        self.linear_l1_bytes = l1_data_cache_bytes() if self.native_linear else None
+        self.linear_tiles, self.linear_tuning = {}, {}
+
+    def tune_linear(self, projections, max_tokens):
+        if self.native_linear:
+            choices, report = tune_tiles(self.rows.pe_linear_tile, projections, self.threads,
+                                         self.linear_l1_bytes, max_tokens)
+            self.linear_tiles.update(choices)
+            self.linear_tuning = report
 
     def rope_layout(self, qkv, cos, sin, heads, dim):
         """Internal FP32 conversion; native results borrow engine-owned storage.
@@ -200,8 +212,18 @@ class CPUAttention:
         out = self.linear_buffers.get(n)
         if out is None or out.shape != shape:
             out = self.linear_buffers[n] = torch.empty(shape, dtype=torch.float32)
-        status = self.rows.pe_linear(x.data_ptr(), weight.data_ptr(), None if bias is None else bias.data_ptr(),
-                                     out.data_ptr(), x.numel() // k, n, k, self.threads)
+        m = x.numel() // k
+        key = (m, n, k)
+        tile = self.linear_tiles.get(key)
+        if tile is None:
+            # Residency is unchanged once M fills the largest (4-row) tile.
+            # Bound the cache across varying request lengths; exact keys hold tuned choices.
+            key = (min(m, 4), n, k)
+            tile = self.linear_tiles.get(key)
+            if tile is None:
+                tile = self.linear_tiles[key] = choose_tile(m, k, self.linear_l1_bytes)
+        status = self.rows.pe_linear_tile(x.data_ptr(), weight.data_ptr(), None if bias is None else bias.data_ptr(),
+                                          out.data_ptr(), m, n, k, self.threads, *tile)
         if status:
             raise PackedEncodersError("native CPU projection failed")
         return out
@@ -313,3 +335,5 @@ class CPUAttention:
         self.output = self.scratch = None
         self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
         self.linear_buffers = {}
+        self.linear_tiles.clear()
+        self.linear_tuning.clear()
