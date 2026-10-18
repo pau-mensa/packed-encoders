@@ -231,6 +231,38 @@ static inline void dequant_row(const int32_t *c, const int32_t *correction, floa
         store(y + n, __builtin_convertvector(loadi(c + n) - loadi(correction + n), v16) * (load(ws + n) * s));
 }
 
+// Fuse dequantization into the residual/statistics pass, avoiding a temporary FP32 row.
+// The two vectors hold the same 32 partial sums as pe_add_norm_row; pe_sum32 retains
+// its reduction tree, and only the variance accumulation uses FMA.
+static inline v16 dequant_vec(const int32_t *c, const int32_t *correction, float s, const float *ws) {
+    return __builtin_convertvector(loadi(c) - loadi(correction), v16) * (load(ws) * s);
+}
+
+static inline void dequant_norm(const int32_t *c, const int32_t *correction, float s, const float *ws,
+                                float *r, const float *weight, const float *bias, float *out, int width, float eps) {
+    v16 p0 = {}, p1 = {};
+    for (int i = 0; i < width; i += 32) {
+        v16 a = load(r + i) + dequant_vec(c + i, correction + i, s, ws + i);
+        v16 b = load(r + i + 16) + dequant_vec(c + i + 16, correction + i + 16, s, ws + i + 16);
+        store(r + i, a); store(r + i + 16, b);
+        p0 += a; p1 += b;
+    }
+    float p[32];
+    store(p, p0); store(p + 16, p1);
+    float mean = pe_sum32(p) / width;
+    p0 = (v16){}; p1 = (v16){};
+    for (int i = 0; i < width; i += 32) {
+        v16 a = load(r + i) - mean, b = load(r + i + 16) - mean;
+        p0 = _mm512_fmadd_ps(a, a, p0); p1 = _mm512_fmadd_ps(b, b, p1);
+    }
+    store(p, p0); store(p + 16, p1);
+    float rstd = 1.f / sqrtf(pe_sum32(p) / width + eps);
+    for (int i = 0; i < width; i += 16) {
+        v16 y = (load(r + i) - mean) * rstd * load(weight + i);
+        store(out + i, bias ? y + load(bias + i) : y);
+    }
+}
+
 // ---------------------------------------------------------------- segments
 static int run(const PeQ8Model *m, const PeQ8Segment *g, const PeQ8Buffers *b, const float *src, int input,
                int tokens, int workers) {
@@ -253,15 +285,15 @@ static int run(const PeQ8Model *m, const PeQ8Segment *g, const PeQ8Buffers *b, c
             for (int r = 0; r < tokens; ++r)
                 emit_row(src + (size_t)r * d, d, m->signs_hidden, m->block_hidden, scratch, ah + (size_t)r * d, s + r);
         } else {
-            float *x = scratch, *y = scratch + d, *tmp = scratch + 2 * d;
+            float *y = scratch + d, *tmp = scratch + 2 * d;
             // Token-major context; its rotation is folded into Wv and Wo.
 #pragma omp for schedule(static)
             for (int r = 0; r < tokens; ++r) emit_row(src + (size_t)r * d, d, NULL, 0, NULL, ah + (size_t)r * d, s + r);
             gemm(ah, d, g->wo, c, d, tokens);
 #pragma omp for schedule(static)
             for (int r = 0; r < tokens; ++r) {
-                dequant_row(c + (size_t)r * d, g->co, s[r], g->so, x, d);
-                pe_add_norm_row(b->residual + (size_t)r * d, x, g->mlp_weight, g->mlp_bias, y, d, g->mlp_eps);
+                dequant_norm(c + (size_t)r * d, g->co, s[r], g->so,
+                             b->residual + (size_t)r * d, g->mlp_weight, g->mlp_bias, y, d, g->mlp_eps);
                 emit_row(y, d, m->signs_hidden, m->block_hidden, tmp, ah + (size_t)r * d, s + r);
             }
             gemm(ah, d, g->wi, c, 2 * w, tokens);
@@ -275,9 +307,9 @@ static int run(const PeQ8Model *m, const PeQ8Segment *g, const PeQ8Buffers *b, c
             gemm(aw, w, g->wmo, c, d, tokens);
 #pragma omp for schedule(static)
             for (int r = 0; r < tokens; ++r) {
-                dequant_row(c + (size_t)r * d, g->cmo, s[r], g->smo, x, d);
                 float *out = g->wqkv ? y : b->out + (size_t)r * d;
-                pe_add_norm_row(b->residual + (size_t)r * d, x, g->after_weight, g->after_bias, out, d, g->after_eps);
+                dequant_norm(c + (size_t)r * d, g->cmo, s[r], g->smo,
+                             b->residual + (size_t)r * d, g->after_weight, g->after_bias, out, d, g->after_eps);
                 if (g->wqkv) emit_row(y, d, m->signs_hidden, m->block_hidden, tmp, ah + (size_t)r * d, s + r);
             }
             qkv = g->wqkv != NULL;
