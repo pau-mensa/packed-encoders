@@ -69,7 +69,7 @@ static void qk_block(const float *q, const float *kt, float *s, int ld, int R, i
 
 // Exponentiated, unnormalized softmax of one score row over its window [first, last), zero
 // elsewhere in [lo, hi) (16-aligned); returns 1 / sum.
-static float softmax_row(float *s, int first, int last, int lo, int hi) {
+static inline __attribute__((always_inline)) float softmax_row(float *s, int first, int last, int lo, int hi) {
     v16 m = (v16){} - INFINITY;
     for (int c = lo; c < hi; c += 16) {
         v16i valid = (iota + c >= first) & (iota + c < last);
@@ -93,22 +93,28 @@ static float softmax_row(float *s, int first, int last, int lo, int hi) {
 // Output rows (stride ldo) = (P V) * inverse sums for R rows over window columns [lo, hi) of V (stride 64).
 static inline __attribute__((always_inline)) void pv(const float *p, int ld, const float *v, int lo, int hi,
                                                      const float *inverse, float *out, int ldo, const int R) {
-    v16 acc[4][4];
-    for (int r = 0; r < R; ++r)
-        for (int x = 0; x < 4; ++x) acc[r][x] = (v16){};
+    // Named accumulators avoid GCC materializing the array on the stack before scaling/storing.
+#define DECL(r) v16 a##r##0 = {}, a##r##1 = {}, a##r##2 = {}, a##r##3 = {};
+    DECL(0) DECL(1) DECL(2) DECL(3)
+#undef DECL
     for (int j = lo; j < hi; ++j) {
         const float *row = v + (size_t)j * 64;
         v16 v0 = load(row), v1 = load(row + 16), v2 = load(row + 32), v3 = load(row + 48);
-        for (int r = 0; r < R; ++r) {
-            float pj = p[(size_t)r * ld + j];
-            acc[r][0] += pj * v0;
-            acc[r][1] += pj * v1;
-            acc[r][2] += pj * v2;
-            acc[r][3] += pj * v3;
-        }
+#define STEP(r) if (R > r) { \
+        float pj = p[(size_t)r * ld + j]; \
+        a##r##0 += pj * v0; a##r##1 += pj * v1; \
+        a##r##2 += pj * v2; a##r##3 += pj * v3; \
     }
-    for (int r = 0; r < R; ++r)
-        for (int x = 0; x < 4; ++x) store(out + (size_t)r * ldo + 16 * x, acc[r][x] * inverse[r]);
+        STEP(0) STEP(1) STEP(2) STEP(3)
+#undef STEP
+    }
+#define OUT(r) if (R > r) { \
+    float *o = out + (size_t)r * ldo; \
+    store(o, a##r##0 * inverse[r]); store(o + 16, a##r##1 * inverse[r]); \
+    store(o + 32, a##r##2 * inverse[r]); store(o + 48, a##r##3 * inverse[r]); \
+}
+    OUT(0) OUT(1) OUT(2) OUT(3)
+#undef OUT
 }
 
 static void pv_block(const float *p, int ld, const float *v, int lo, int hi, const float *inverse, float *out,
@@ -150,6 +156,39 @@ static void tile_attention(const float *q, const float *k, const float *v, float
     }
 }
 
+// Full-window 16/32-token sequences: constant strides and no row tails or masks.
+// Keep the same dot products, softmax reduction order and output scaling as the general path.
+static inline __attribute__((always_inline)) void short_attention(
+        const float *q, const float *k, const float *v, float *out, int ldo,
+        float *kt, float *scores, const int length) {
+    typedef float v4 __attribute__((vector_size(16)));
+    typedef float v4u __attribute__((vector_size(16), aligned(4), may_alias));
+    typedef int v4i __attribute__((vector_size(16)));
+    // Transpose 4x4 blocks with vector loads/stores; the general path uses scalar stores.
+    for (int j = 0; j < length; j += 4) {
+        for (int d = 0; d < 64; d += 4) {
+            v4 a = *(const v4u *)(k + j * 64 + d), b = *(const v4u *)(k + (j + 1) * 64 + d);
+            v4 c = *(const v4u *)(k + (j + 2) * 64 + d), e = *(const v4u *)(k + (j + 3) * 64 + d);
+            v4 ab0 = __builtin_shuffle(a, b, (v4i){0, 4, 1, 5});
+            v4 ab1 = __builtin_shuffle(a, b, (v4i){2, 6, 3, 7});
+            v4 ce0 = __builtin_shuffle(c, e, (v4i){0, 4, 1, 5});
+            v4 ce1 = __builtin_shuffle(c, e, (v4i){2, 6, 3, 7});
+            *(v4u *)(kt + d * length + j) = __builtin_shuffle(ab0, ce0, (v4i){0, 1, 4, 5});
+            *(v4u *)(kt + (d + 1) * length + j) = __builtin_shuffle(ab0, ce0, (v4i){2, 3, 6, 7});
+            *(v4u *)(kt + (d + 2) * length + j) = __builtin_shuffle(ab1, ce1, (v4i){0, 1, 4, 5});
+            *(v4u *)(kt + (d + 3) * length + j) = __builtin_shuffle(ab1, ce1, (v4i){2, 3, 6, 7});
+        }
+    }
+    for (int r0 = 0; r0 < length; r0 += 4) {
+        float *s = scores + r0 * length;
+        qk(q + r0 * 64, kt, s, length, 4, length / 16);
+        float inverse[4];
+        for (int r = 0; r < 4; ++r)
+            inverse[r] = softmax_row(s + r * length, 0, length, 0, length);
+        pv(s, length, v, 0, length, inverse, out + (size_t)r0 * ldo, ldo, 4);
+    }
+}
+
 int pe_local_attention(const float *q, const float *k, const float *v, float *out, const int *lengths, int tokens,
                        int heads, int sequences, int tile, int half, int token_major, int workers, float *scratch,
                        size_t scratch_floats) {
@@ -177,6 +216,16 @@ int pe_local_attention(const float *q, const float *k, const float *v, float *ou
         size_t base = ((size_t)head * tokens + offsets[sequence]) * 64;
         float *o = out + (token_major ? ((size_t)offsets[sequence] * heads + head) * 64 : base);
         float *kt = scratch + (size_t)omp_get_thread_num() * per_worker, *scores = kt + 64 * ld;
+        if (tile >= length && half >= length - 1) {
+            if (length == 16) {
+                short_attention(q + base, k + base, v + base, o, ldo, kt, scores, 16);
+                continue;
+            }
+            if (length == 32) {
+                short_attention(q + base, k + base, v + base, o, ldo, kt, scores, 32);
+                continue;
+            }
+        }
         for (int start = 0; start < length; start += tile)
             tile_attention(q + base, k + base, v + base, o, ldo, kt, scores, length, start,
                            length - start < tile ? length - start : tile, half);

@@ -372,6 +372,17 @@ def test_avx2_build_keeps_native_rows_and_attention(model, monkeypatch):
     assert attention.rows is library and attention.library is library
     assert attention.fused_rope and attention.fused_geglu and attention.fused_norm
     assert not attention.native_linear
+    # The short attention specializations also work when v16 uses two AVX2 halves.
+    rng = torch.Generator().manual_seed(43)
+    lengths = (16, 32)
+    q, k, v = [torch.randn(1, 2, sum(lengths), 64, generator=rng) for _ in range(3)]
+    boundaries = torch.tensor(lengths, dtype=torch.int32)
+    expected = attention._sdpa(q, k, v, lengths, local=False)
+    actual = attention.global_(q, k, v, lengths, boundaries).clone()
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    attention.tile = 4
+    general = attention.global_(q, k, v, lengths, boundaries)
+    assert torch.equal(actual, general)
 
 
 @native_linear
