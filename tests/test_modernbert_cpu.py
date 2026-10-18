@@ -654,6 +654,55 @@ def test_int8_matches_its_emulation(model):
 
 
 @int8_kernels
+@pytest.mark.parametrize("threads", [1, 8])
+@torch.no_grad()
+def test_int8_prepared_attention_reuses_current_buffers(model, monkeypatch, threads):
+    from packed_encoders.cpu.int8 import vnni_available
+    if not vnni_available():
+        pytest.skip("x86 native attention call preparation")
+    scale_projections(model)
+    pe.pack(model, engine=pe.ModernBertCPU(threads=threads), precision="int8", attention_backend="native")
+    engine = pe.get_engine(model)
+    att = engine.attention
+    prepare = att._native_args
+    calls = []
+
+    def record(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        calls.append(result[1])
+        return result
+
+    monkeypatch.setattr(att, "_native_args", record)
+    # Grow, shrink, cross the SDPA cutoff, then reuse larger allocations. 128-token
+    # sequences exercise distinct local/global windows sharing the same scratch.
+    saved = None
+    for lengths in ((16,), (32,), (32,) * 8, (3, 17, 32), (128,), (129,), (16,)):
+        ids = torch.arange(sum(lengths)) % 61 + 3
+        positions = torch.cat([torch.arange(n) for n in lengths])
+        calls.clear()
+        actual = engine.forward_packed(pe.PackedBatch(ids, host_lengths=lengths)).clone()
+        if max(lengths) <= 128:
+            assert len(calls) == 2  # once per window kind, rather than per layer
+            assert calls[0][3] == calls[1][3] == att.output.data_ptr()
+            assert calls[0][-2] == calls[1][-2] == att.scratch.data_ptr()
+        expected = emulate_int8(engine, ids, lengths, positions, kernel_quantize=True)
+        assert float((actual - expected).norm() / expected.norm()) < 1e-6
+        if lengths == (16,):
+            if saved is None:
+                saved = actual
+            else:
+                assert torch.equal(actual, saved)
+
+    # Disabling token-major native output must retain the layout-conversion path.
+    ids = torch.arange(32) % 61 + 3
+    batch = pe.PackedBatch(ids, host_lengths=(32,))
+    expected = engine.forward_packed(batch).clone()
+    att.token_major = False
+    actual = engine.forward_packed(batch)
+    assert torch.equal(actual, expected)
+
+
+@int8_kernels
 def test_int8_fallbacks_and_weight_updates(model):
     ids, mask = inputs()
     ids, mask = ids[:, :8], mask[:, :8]

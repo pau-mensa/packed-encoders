@@ -301,12 +301,30 @@ class Int8Projections:
         model, buffers = ctypes.addressof(self.geometry), ctypes.addressof(b)
         if self.library.pe_q8_input(model, ctypes.addressof(self.first), buffers, normed.data_ptr(), tokens, self.workers):
             raise PackedEncodersError("native CPU int8 input projection failed")
+        # Every segment overwrites the same RoPE storage; its views and native call
+        # arguments can be reused throughout this forward, including changing windows.
+        q, k, v = rope.unbind(0)
+        att, longest = engine.attention, max(lengths)
+        native_args = None
+        if self.x86 and att.native_local and att.native_global and att.token_major and longest <= 128:
+            # Global attention reserves the largest scratch window. Preparing local
+            # attention afterwards cannot invalidate the global call's pointers.
+            context, global_args = att._native_args(q, k, v, lengths, boundaries, longest, True)
+            _, local_args = att._native_args(q, k, v, lengths, boundaries, att.half, True)
+            native_args = {"full_attention": global_args, "sliding_attention": local_args}
+            native_attention = att.library.pe_local_attention
+            context_ptr = context.data_ptr()
         for kind, segment in zip(engine.kinds, self.segments):
-            q, k, v = rope.unbind(0)
-            # x86 segments read token-major context; Apple's gather heads from head-major.
-            attention = engine.attention.local if kind == "sliding_attention" else engine.attention.global_
-            context = attention(q, k, v, lengths, boundaries, token_major=self.x86).contiguous()
-            if self.library.pe_q8_segment(model, ctypes.addressof(segment), buffers, context.data_ptr(),
+            if native_args is not None:
+                status = native_attention(*native_args[kind])
+                if status:
+                    raise PackedEncodersError(f"native CPU attention failed: {status}")
+            else:
+                # x86 reads token-major context; Apple gathers heads from head-major.
+                attention = att.local if kind == "sliding_attention" else att.global_
+                context = attention(q, k, v, lengths, boundaries, token_major=self.x86).contiguous()
+                context_ptr = context.data_ptr()
+            if self.library.pe_q8_segment(model, ctypes.addressof(segment), buffers, context_ptr,
                                           tokens, self.workers):
                 raise PackedEncodersError("native CPU int8 layer failed")
         return out[0]

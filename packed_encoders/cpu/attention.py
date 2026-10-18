@@ -294,6 +294,18 @@ class CPUAttention:
     def _native(self, q, k, v, lengths, boundaries, half, token_major=False):
         # Keys within `half` positions; at least the longest length is global.
         q, k, v = (t.contiguous() for t in (q, k, v))
+        out, args = self._native_args(q, k, v, lengths, boundaries, half, token_major)
+        status = self.library.pe_local_attention(*args)
+        if status:
+            raise PackedEncodersError(f"native CPU attention failed: {status}")
+        return out if not token_major or self.token_major else self._layout(out, True)
+
+    def _native_args(self, q, k, v, lengths, boundaries, half, token_major=False):
+        """Prepare a call on contiguous Q/K/V; pointers borrow the tensors and engine buffers.
+
+        The caller keeps inputs alive and consumes the plan before any buffer reallocation.
+        Multiple windows on the same input can share storage if the widest is prepared first.
+        """
         _, heads, tokens, dim = q.shape
         workers = min(self.threads, heads * len(lengths))
         # Scores [tile, columns] per worker; x86 also transposes the key window, padded to 16 keys.
@@ -305,14 +317,12 @@ class CPUAttention:
         shape = (1, tokens, heads * dim) if direct else q.shape
         if self.output is None or self.output.shape != shape:
             self.output = torch.empty(shape, dtype=torch.float32)
-        status = self.library.pe_local_attention(
+        args = (
             q.data_ptr(), k.data_ptr(), v.data_ptr(), self.output.data_ptr(), boundaries.data_ptr(),
             tokens, heads, len(lengths), self.tile, half, direct, workers, self.scratch.data_ptr(),
             self.scratch.numel(),
         )
-        if status:
-            raise PackedEncodersError(f"native CPU attention failed: {status}")
-        return self.output if direct or not token_major else self._layout(self.output, True)
+        return self.output, args
 
     def _sdpa(self, q, k, v, lengths, *, local):
         out = torch.empty_like(q)
