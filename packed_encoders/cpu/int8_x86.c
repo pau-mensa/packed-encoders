@@ -162,23 +162,37 @@ static const v16 SIGN[4] = {
 
 // dst = H_block (signs * src) for one block (64 or 128, unnormalized, Sylvester order); returns
 // max |dst| lanes. Same butterflies in the same order as int8.c, so the same bits.
-static inline v16 fwht_block(const float *src, const float *signs, float *dst, int block) {
-    v16 r[8], mx = {};
-    const int nv = block / 16;
-    for (int i = 0; i < nv; ++i) r[i] = load(src + 16 * i) * load(signs + 16 * i);
-    for (int d = nv / 2; d >= 1; d /= 2)  // h = 16 d: vectors d apart
-        for (int i = 0; i < nv; ++i)
-            if (!(i & d)) {
-                v16 a = r[i], b = r[i + d];
-                r[i] = a + b;
-                r[i + d] = a - b;
-            }
-    for (int s = 3; s >= 0; --s)  // h = 8, 4, 2, 1 inside each vector
-        for (int i = 0; i < nv; ++i) r[i] = __builtin_shuffle(r[i], SWAP[s]) + r[i] * SIGN[s];
-    for (int i = 0; i < nv; ++i) {
-        mx = vmax(mx, vabs(r[i]));
-        store(dst + 16 * i, r[i]);
+// Named vectors and constant block sizes keep the butterflies in registers;
+// dynamically indexing an array made GCC write the intermediate stages to the stack.
+static inline __attribute__((always_inline)) v16 fwht_block(const float *src, const float *signs,
+                                                            float *dst, const int block) {
+#define LOAD(i) v16 r##i = load(src + 16 * (i)) * load(signs + 16 * (i))
+    LOAD(0); LOAD(1); LOAD(2); LOAD(3);
+    v16 r4 = {}, r5 = {}, r6 = {}, r7 = {}, mx = {};
+#define PAIR(a, b) do { v16 x = r##a, y = r##b; r##a = x + y; r##b = x - y; } while (0)
+    if (block == 128) {
+        r4 = load(src + 64) * load(signs + 64);
+        r5 = load(src + 80) * load(signs + 80);
+        r6 = load(src + 96) * load(signs + 96);
+        r7 = load(src + 112) * load(signs + 112);
+        PAIR(0, 4); PAIR(1, 5); PAIR(2, 6); PAIR(3, 7);  // h = 64
+        PAIR(4, 6); PAIR(5, 7);                         // h = 32, upper half
+        PAIR(4, 5); PAIR(6, 7);                         // h = 16, upper half
     }
+    PAIR(0, 2); PAIR(1, 3);                             // h = 32, lower half
+    PAIR(0, 1); PAIR(2, 3);                             // h = 16, lower half
+#define LANES(i, s) r##i = __builtin_shuffle(r##i, SWAP[s]) + r##i * SIGN[s]
+#define OUT(i) do {                                                                                             \
+        LANES(i, 3); LANES(i, 2); LANES(i, 1); LANES(i, 0);                                                     \
+        mx = vmax(mx, vabs(r##i));                                                                              \
+        store(dst + 16 * (i), r##i);                                                                            \
+    } while (0)
+    OUT(0); OUT(1); OUT(2); OUT(3);
+    if (block == 128) { OUT(4); OUT(5); OUT(6); OUT(7); }
+#undef LOAD
+#undef PAIR
+#undef LANES
+#undef OUT
     return mx;
 }
 
@@ -198,7 +212,11 @@ static inline void emit_row(const float *src, int K, const float *signs, int blo
                             float *scale) {
     v16 mx = {};
     if (signs) {
-        for (int k = 0; k < K; k += block) mx = vmax(mx, fwht_block(src + k, signs + k, tmp + k, block));
+        if (block == 128) {
+            for (int k = 0; k < K; k += 128) mx = vmax(mx, fwht_block(src + k, signs + k, tmp + k, 128));
+        } else {
+            for (int k = 0; k < K; k += 64) mx = vmax(mx, fwht_block(src + k, signs + k, tmp + k, 64));
+        }
         quant_row(tmp, K, hmax(mx), 1.0f / sqrtf((float)block), dst, scale);
         return;
     }
