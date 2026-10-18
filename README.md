@@ -66,7 +66,7 @@ From source, the lockfile selects Torch 2.11 / Triton 3.6 / CUDA 12.8:
 git clone git@github.com:pau-mensa/packed-encoders.git
 cd packed-encoders
 uv sync --locked --no-dev --extra cuda                   # GPU runtime
-uv sync --locked --no-dev                                # CPU runtime (macOS)
+uv sync --locked --no-dev                                # CPU runtime (macOS; Linux: see below)
 uv sync --locked --no-dev --extra fa2                     # compiled FA2, including RTX 5090
 uv sync --locked --no-dev --extra fa2 --extra pylate       # PyLate / ModernColBERT
 uv sync --locked --no-dev --extra qwen3_5 --extra fa2      # topk-embed-v1, complete environment
@@ -116,7 +116,7 @@ For the tested environments and remaining performance checks, see
 
 - GPU: an NVIDIA GPU of compute capability sm_80, sm_89, sm_90, sm_100, or sm_120, with a working `ptxas` (CuteDSL JIT-compiles at runtime).
 - GPU: bf16 weights for inference, or fp32 master weights under bf16 autocast for training.
-- CPU: ModernBERT with FP32 weights. The experimental Apple Silicon backend uses Accelerate for local attention; other CPUs use tiled PyTorch SDPA. See [CPU runtime](docs/modernbert-cpu.md).
+- CPU: ModernBERT with FP32 weights; install with `uv pip install --no-sources --torch-backend cpu -e .` on Linux. Native kernels run on Apple Silicon (Accelerate, built with Xcode Command Line Tools) and Linux x86-64 (built with `gcc`; the FP32 projection GEMM needs AVX-512). Opt-in int8 (`precision="int8"`) needs an Apple M4 (SME2) or an x86 CPU with AVX512-VNNI. Other CPUs, or machines without the compiler, use tiled PyTorch SDPA and PyTorch ops. See [CPU runtime](docs/modernbert-cpu.md).
 
 ## ⚡️ Quick Start
 

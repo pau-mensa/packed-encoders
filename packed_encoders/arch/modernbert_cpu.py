@@ -78,10 +78,13 @@ class CPUAdapter:
 
 
 class ModernBertCPU:
-    """CPU configuration. Thread count controls native attention/RoPE workers.
+    """CPU configuration. Thread count controls the native kernels' workers
+    (attention, row kernels, x86 FP32 projections and int8 projections); it
+    defaults to PyTorch's thread count at packing.
 
-    Matrix operations use PyTorch/Accelerate's existing thread settings. This
-    engine never changes process-global threading configuration.
+    Other matrix operations (Apple FP32 projections, SDPA) use PyTorch/Accelerate's
+    existing thread settings. This engine never changes process-global threading
+    configuration.
 
     ``rehome_weights=True`` moves the projection weights into fresh process
     memory when packing (same Parameter objects and values, new storage). It
