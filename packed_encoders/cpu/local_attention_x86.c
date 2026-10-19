@@ -3,7 +3,7 @@
 // [total_tokens, heads * 64] (the next projection's input layout). Lengths delimit sequences.
 // Queries attend keys within `half` positions in their sequence; a half-width of at least the
 // longest sequence gives exact global attention. No fast-math; built with contraction on (unlike
-// rows.c), so the dot products accumulate with FMAs.
+// rows.c), so the dot products accumulate with FMAs. OpenMP threads it; `pool` is ignored.
 // GCC vector extensions: one AVX-512 register per v16, or two AVX2 halves on older CPUs.
 // Build: gcc -O3 -march=native -ffp-contract=fast -fno-trapping-math -fno-math-errno -fopenmp -c local_attention_x86.c
 #include <math.h>
@@ -190,8 +190,9 @@ static inline __attribute__((always_inline)) void short_attention(
 }
 
 int pe_local_attention(const float *q, const float *k, const float *v, float *out, const int *lengths, int tokens,
-                       int heads, int sequences, int tile, int half, int token_major, int workers, float *scratch,
-                       size_t scratch_floats) {
+                       int heads, int sequences, int tile, int half, int token_major, int workers, void *pool,
+                       float *scratch, size_t scratch_floats) {
+    (void)pool;
     if (tokens < 1 || heads < 1 || sequences < 1 || tile < 1 || tile > 4096 || half < 0 || workers < 1)
         return -1;
     long total = 0;

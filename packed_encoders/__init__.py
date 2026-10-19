@@ -7,8 +7,8 @@ inherits the speedup with no adapter. Curated engines (`packed_encoders.arch`):
 - ModernBERT / Ettin / mmBERT: CuteDSL LayerNorm, RoPE and GeGLU, cuBLAS GEMMs, packed
   attention with per-GPU dispatch; CUDA graphs optional (off by default).
 - CPU ModernBERT: FP32 packed inference with native attention and row kernels on
-  Apple Silicon (Accelerate, plus a prepared SME2 FP32 GEMM with its own worker pool)
-  and Linux x86-64 (GCC, plus a native FP32 GEMM on AVX-512), else tiled CPU SDPA;
+  Apple Silicon (Accelerate, plus a prepared SME2 FP32 GEMM; with it, the native kernels run
+  on an engine-owned worker pool) and Linux x86-64 (GCC, plus a native FP32 GEMM on AVX-512), else tiled CPU SDPA;
   opt-in int8 projections on Apple SME2 or x86
   AVX512-VNNI (`precision="int8"`); original-forward fallback for training and
   extra HF outputs.

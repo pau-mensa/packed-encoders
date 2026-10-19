@@ -3,139 +3,23 @@
 // Each output accumulates k in increasing order, independently of row/worker count.
 // Only this translation unit targets SME2; the ordinary Apple kernels stay portable.
 //
-// Each P cluster shares one SME unit. GCD wakes short bursts of two or four workers on a
-// single cluster (one SME unit), while long-lived threads spread across both, so workers
-// come from an engine-owned pool. The caller is worker 0 and the others take input-packing
-// tasks, then output tiles, from atomic counters.
+// Workers run on the engine's pool (pool.h): the caller is worker 0, and every worker takes
+// input-packing tasks, then output tiles, from atomic counters. The efficiency cluster has an
+// SME unit of its own. On the M4 Pro, helpers there paid off with four or fewer workers
+// (skipping one left too few to keep both P-cluster units busy) or above 128 rows; otherwise
+// their last tiles held back the projection.
 #include <arm_neon.h>
 #include <arm_sme.h>
-#include <mach/mach_time.h>
-#include <os/os_sync_wait_on_address.h>
-#include <pthread.h>
-#include <stdatomic.h>
 #include <stddef.h>
-#include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-#define MAX_WORKERS 16
+#include "pool.h"
+
 // Rows per output-tile group above this, so a group's packed rows stay in L2 across panels.
 #define ROW_CHUNK 512
 #define PACK_COLUMNS 256
 
 __arm_locally_streaming int pe_sme_fp32_available(void) { return svcntw() == 16; }
-
-typedef struct {
-    pthread_t threads[MAX_WORKERS];
-    int size, participants;
-    pid_t pid;
-    uint64_t spin;
-    _Atomic uint32_t generation;
-    _Atomic int pending, sleepers, stop;
-    void (*fn)(void *);
-    void *arg;
-} Pool;
-
-typedef struct {
-    Pool *pool;
-    int index;
-} Start;
-
-static _Atomic int live_threads;
-
-int pe_sme_fp32_pool_threads(void) { return atomic_load(&live_threads); }
-
-// Spin through the short gaps between projections, then park.
-static uint32_t pool_wait(Pool *pool, uint32_t seen) {
-    uint64_t start = mach_absolute_time();
-    for (;;) {
-        uint32_t generation = atomic_load_explicit(&pool->generation, memory_order_acquire);
-        if (generation != seen) return generation;
-        if (mach_absolute_time() - start >= pool->spin) break;
-        __asm__ volatile("yield");
-    }
-    for (;;) {
-        // Paired with the caller's generation bump and sleeper check (both sequentially consistent).
-        atomic_fetch_add(&pool->sleepers, 1);
-        if (atomic_load(&pool->generation) == seen)
-            os_sync_wait_on_address(&pool->generation, seen, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE);
-        atomic_fetch_sub(&pool->sleepers, 1);
-        uint32_t generation = atomic_load(&pool->generation);
-        if (generation != seen) return generation;
-    }
-}
-
-static void *pool_thread(void *opaque) {
-    Start start = *(Start *)opaque;
-    free(opaque);
-    Pool *pool = start.pool;
-    uint32_t seen = 0;
-    for (;;) {
-        seen = pool_wait(pool, seen);
-        if (atomic_load(&pool->stop)) break;
-        if (start.index < pool->participants) pool->fn(pool->arg);
-        atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_release);
-    }
-    atomic_fetch_sub(&live_threads, 1);
-    return NULL;
-}
-
-void *pe_sme_fp32_pool(int workers, int spin_us) {
-    if (workers < 1 || workers > MAX_WORKERS || spin_us < 0) return NULL;
-    Pool *pool = calloc(1, sizeof(Pool));
-    if (!pool) return NULL;
-    mach_timebase_info_data_t timebase;
-    mach_timebase_info(&timebase);
-    pool->spin = (uint64_t)spin_us * 1000 * timebase.denom / timebase.numer;
-    pool->pid = getpid();
-    pool->size = 1;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0);
-    for (int i = 1; i < workers; ++i) {
-        Start *start = malloc(sizeof(Start));
-        if (!start) break;
-        *start = (Start){pool, i};
-        atomic_fetch_add(&live_threads, 1);
-        if (pthread_create(&pool->threads[i], &attr, pool_thread, start)) {
-            atomic_fetch_sub(&live_threads, 1);
-            free(start);
-            break;
-        }
-        pool->size = i + 1;  // Fewer threads than requested only lowers parallelism.
-    }
-    pthread_attr_destroy(&attr);
-    return pool;
-}
-
-void pe_sme_fp32_pool_free(void *opaque) {
-    Pool *pool = opaque;
-    if (!pool) return;
-    if (pool->pid == getpid()) {
-        atomic_store(&pool->stop, 1);
-        atomic_fetch_add(&pool->generation, 1);
-        os_sync_wake_by_address_all(&pool->generation, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE);
-        for (int i = 1; i < pool->size; ++i) pthread_join(pool->threads[i], NULL);
-    }
-    free(pool);
-}
-
-// One caller at a time per pool. A forked child has no pool threads and runs alone.
-static void pool_run(Pool *pool, void (*fn)(void *), void *arg, int participants) {
-    if (!pool || participants <= 1 || pool->size == 1 || pool->pid != getpid()) {
-        fn(arg);
-        return;
-    }
-    pool->fn = fn;
-    pool->arg = arg;
-    pool->participants = participants;
-    atomic_store_explicit(&pool->pending, pool->size - 1, memory_order_relaxed);
-    atomic_fetch_add(&pool->generation, 1);
-    if (atomic_load(&pool->sleepers)) os_sync_wake_by_address_all(&pool->generation, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE);
-    fn(arg);
-    while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) __asm__ volatile("yield");
-}
 
 // Packed input [ceil(m/16), k, 16]: rows past m are zero. One task covers 16 rows x a column range.
 static void pack_block(const float *x, int m, int k, float *packed, int mb, int c0, int c1) {
@@ -228,8 +112,9 @@ static void gemm(Context *c) {
     }
 }
 
-static void worker(void *opaque) {
+static void worker(void *opaque, size_t index) {
     Context *c = opaque;
+    (void)index;
     for (int task; (task = atomic_fetch_add_explicit(&c->pack_next, 1, memory_order_relaxed)) < c->pack_tasks;) {
         int c0 = task % c->column_chunks * c->columns;
         pack_block(c->x, c->m, c->k, c->a, task / c->column_chunks * 16, c0, c0 + c->columns < c->k ? c0 + c->columns : c->k);
@@ -252,6 +137,6 @@ int pe_sme_fp32_linear(void *pool, const float *x, const float *w, float *out, f
     Context context = {.x = x, .w = w, .a = scratch, .out = out, .m = m, .n = n, .k = k, .columns = columns,
                        .column_chunks = column_chunks, .pack_tasks = (m + 15) / 16 * column_chunks,
                        .panels = panels, .rows = rows, .tiles = tiles};
-    pool_run(pool, worker, &context, workers);
+    pe_pool_apply(pool, (size_t)workers, &context, worker, workers <= 4 || m > 128);
     return 0;
 }

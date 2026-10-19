@@ -7,7 +7,6 @@ from pathlib import Path
 import platform
 import subprocess
 import tempfile
-import weakref
 
 import torch
 
@@ -32,7 +31,7 @@ def library():
     output = Path(directory.name) / "fp32.dylib"
     try:
         subprocess.run(
-            # Every SME2 Mac runs macOS 15 or later; the pool parks on os_sync_wait_on_address (14.4).
+            # Every SME2 Mac runs macOS 15 or later; pool.h wakes with os_sync_wake_by_address_all (14.4).
             ["xcrun", "clang", "-O3", "-march=armv8-a+sme2", "-mmacosx-version-min=15.0", "-Wall", "-Wextra",
              "-Werror", "-dynamiclib", str(Path(__file__).with_name("fp32_sme.c")), "-o", str(output)],
             check=True, capture_output=True, timeout=60,
@@ -48,37 +47,24 @@ def library():
         raise PackedEncodersError("FP32 SME needs 512-bit streaming vectors; using Accelerate")
     lib.pe_sme_fp32_linear.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_size_t]
     lib.pe_sme_fp32_linear.restype = ctypes.c_int
-    lib.pe_sme_fp32_pool.argtypes, lib.pe_sme_fp32_pool.restype = [ctypes.c_int] * 2, ctypes.c_void_p
-    lib.pe_sme_fp32_pool_free.argtypes, lib.pe_sme_fp32_pool_free.restype = [ctypes.c_void_p], None
-    lib.pe_sme_fp32_pool_threads.argtypes, lib.pe_sme_fp32_pool_threads.restype = [], ctypes.c_int
     return lib, directory
 
 
 class FP32Projections:
-    """Engine-owned weight copies, reusable buffers and worker pool; original parameters stay intact."""
+    """Engine-owned weight copies and reusable buffers; original parameters stay intact. Workers
+    come from the engine's pool (attention.WorkerPool), or from GCD without one."""
 
     # One token favors Accelerate. The upper crossover depends on the thread budget: on the
     # M4 Pro, SME led through 128 rows on one thread, 1,024 on two and 4,096 on four or eight.
     min_rows, max_rows = 2, 128
     worker_limit = 8
-    # Idle pool workers spin this long before parking. Parked workers wake on one P cluster,
-    # so small budgets spin to keep both SME units; when the spinning workers and the row
-    # kernels' GCD workers would not fit on the performance cores together, workers park.
-    spin_us = 200
 
-    def __init__(self, projections, threads=1):
+    def __init__(self, projections, threads=1, pool=None):
         self.library, _ = library()
         self.max_rows = 128 if threads == 1 else 1024 if threads < 4 else 4096
         self.weights, self.outputs = {}, {}
         self.scratch = None
-        self.workers = min(threads, self.worker_limit)
-        self.pool = None
-        if self.workers > 1:
-            spin = self.spin_us if 2 * threads - 1 <= (_sysctl_int(b"hw.perflevel0.logicalcpu") or 0) else 0
-            self.pool = self.library.pe_sme_fp32_pool(self.workers, spin)
-            if not self.pool:
-                raise PackedEncodersError("FP32 SME worker pool unavailable")
-            self._release = weakref.finalize(self, self.library.pe_sme_fp32_pool_free, self.pool)
+        self.workers, self.pool = min(threads, self.worker_limit), pool
         for weight, bias in projections:
             if (bias is not None or weight.ndim != 2 or weight.device.type != "cpu"
                     or weight.dtype != torch.float32 or not weight.is_contiguous()):
@@ -124,7 +110,8 @@ class FP32Projections:
         needed = ((m + 15) // 16) * 16 * k
         if self.scratch is None or self.scratch.numel() < needed:
             self.scratch = torch.empty(needed, dtype=torch.float32, device="cpu")
-        status = self.library.pe_sme_fp32_linear(self.pool, x.data_ptr(), packed.data_ptr(), out.data_ptr(),
+        pool = None if self.pool is None else self.pool.handle
+        status = self.library.pe_sme_fp32_linear(pool, x.data_ptr(), packed.data_ptr(), out.data_ptr(),
                                                 self.scratch.data_ptr(), m, n, k, min(threads, self.workers),
                                                 self.scratch.numel())
         if status:
@@ -132,9 +119,7 @@ class FP32Projections:
         return out
 
     def close(self):
-        if self.pool is not None:
-            self._release()
-            self.pool = None
+        self.pool = None
         self.weights.clear()
         self.outputs.clear()
         self.scratch = None

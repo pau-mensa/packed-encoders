@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import warnings
+import weakref
 
 import torch
 from torch import nn
@@ -24,31 +25,36 @@ def _library():
     # Process-private directory: no shared writable executable cache, stale ABI,
     # or concurrent compiler races. Keep the directory alive with the library.
     directory = tempfile.TemporaryDirectory(prefix="packed-encoders-cpu-")
-    path = Path(directory.name) / "attention.dylib"
+    path, here = Path(directory.name) / "attention.dylib", Path(__file__).parent
     try:
         subprocess.run(
-            ["xcrun", "clang", "-O3", "-Wall", "-Wextra", "-Werror", "-dynamiclib",
-             "-framework", "Accelerate", str(Path(__file__).with_name("local_attention.c")), "-o", str(path)],
+            ["xcrun", "clang", "-O3", "-Wall", "-Wextra", "-Werror", "-dynamiclib", "-framework", "Accelerate",
+             str(here / "local_attention.c"), str(here / "pool.c"), "-o", str(path)],
             check=True, capture_output=True, timeout=30,
         )
-        return _signatures(ctypes.CDLL(str(path))), directory
+        library = _signatures(ctypes.CDLL(str(path)))
+        library.pe_pool.argtypes, library.pe_pool.restype = [ctypes.c_int] * 3, ctypes.c_void_p
+        library.pe_pool_free.argtypes, library.pe_pool_free.restype = [ctypes.c_void_p], None
+        library.pe_pool_threads.argtypes, library.pe_pool_threads.restype = [], ctypes.c_int
+        return library, directory
     except (OSError, subprocess.SubprocessError) as exc:
         directory.cleanup()
         raise PackedEncodersError("Apple CPU attention needs the Xcode Command Line Tools (xcrun clang)") from exc
 
 
 def _signatures(library):
+    # Every entry point takes the worker count and then a worker pool (Apple; x86 ignores it).
     fn = library.pe_local_attention
-    fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 7 + [ctypes.c_void_p, ctypes.c_size_t]
+    fn.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 7 + [ctypes.c_void_p] * 2 + [ctypes.c_size_t]
     fn.restype = ctypes.c_int
     rope = library.pe_rope_layout
-    rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
+    rope.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
     rope.restype = ctypes.c_int
     geglu = library.pe_geglu
-    geglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3
+    geglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
     geglu.restype = ctypes.c_int
     norm = library.pe_add_layer_norm
-    norm.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2 + [ctypes.c_float, ctypes.c_int]
+    norm.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2 + [ctypes.c_float, ctypes.c_int, ctypes.c_void_p]
     norm.restype = ctypes.c_int
     return library
 
@@ -102,6 +108,29 @@ def _x86_library():
         raise PackedEncodersError("native x86 CPU kernels need gcc with OpenMP") from exc
 
 
+class WorkerPool:
+    """Native worker threads owned by one engine (pool.h); ``threads`` counts the calling thread."""
+
+    # Idle workers spin this long before parking: parked workers wake on the caller's P cluster
+    # (one SME unit). Budgets beyond the performance cores park at once, so spinning threads
+    # never take a core from working ones.
+    spin_us = 200
+
+    def __init__(self, library, threads):
+        from packed_encoders.cpu.sme import _sysctl_int
+        spin = self.spin_us if threads <= (_sysctl_int(b"hw.perflevel0.logicalcpu") or 0) else 0
+        # Without a second performance level, perflevel1 is absent and no core counts as efficiency.
+        self.handle = library.pe_pool(min(threads, 16), spin, _sysctl_int(b"hw.perflevel1.logicalcpu") or 0)
+        if not self.handle:
+            raise PackedEncodersError("native CPU worker pool unavailable")
+        self._release = weakref.finalize(self, library.pe_pool_free, self.handle)
+
+    def close(self):
+        if self.handle is not None:
+            self._release()
+            self.handle = None
+
+
 class ResolvedNorm:
     """A norm module resolved once for add_norm. A plain affine LayerNorm also keeps aliases of
     its parameters: they share the module's storage, so in-place updates are read, while
@@ -124,7 +153,7 @@ class CPUAttention:
         apple = platform.system() == "Darwin" and platform.machine() == "arm64"
         x86 = platform.system() == "Linux" and platform.machine() == "x86_64"
         native = (apple or x86) and head_dim == 64 and half_window == 64
-        self.library = self.rows = None
+        self.library = self.rows = self.pool = None
         if backend == "native" and not native:
             raise PackedEncodersError("native CPU attention requires Apple Silicon or Linux x86-64, head_dim=64 "
                                       "and local_attention=128")
@@ -168,10 +197,20 @@ class CPUAttention:
         if self.rows is None or not sme2_available():
             return
         try:
-            prepared = FP32Projections(projections, self.threads)
+            # With SME projections, every native kernel runs on one engine-owned pool.
+            if self.threads > 1:
+                self.pool = WorkerPool(self.rows, self.threads)
+            prepared = FP32Projections(projections, self.threads, self.pool)
             self.sme = prepared if prepared.weights else None
         except PackedEncodersError as exc:
             warnings.warn(str(exc), stacklevel=3)
+        if self.sme is None and self.pool is not None:
+            self.pool.close()
+            self.pool = None
+
+    @property
+    def _pool_handle(self):
+        return None if self.pool is None else self.pool.handle
 
     def tune_linear(self, projections, max_tokens):
         if self.native_linear:
@@ -194,7 +233,7 @@ class CPUAttention:
                 self.rope_buffer = torch.empty(shape, dtype=torch.float32)
             status = self.rows.pe_rope_layout(
                 qkv.data_ptr(), cos.data_ptr(), sin.data_ptr(), self.rope_buffer.data_ptr(),
-                tokens, heads, self.threads,
+                tokens, heads, self.threads, self._pool_handle,
             )
             if status:
                 raise PackedEncodersError("native CPU RoPE/layout failed")
@@ -254,7 +293,8 @@ class CPUAttention:
         tokens, width = hidden.shape[1], hidden.shape[2] // 2
         if self.geglu_buffer is None or self.geglu_buffer.shape != (1, tokens, width):
             self.geglu_buffer = torch.empty((1, tokens, width), dtype=torch.float32)
-        status = self.rows.pe_geglu(hidden.data_ptr(), self.geglu_buffer.data_ptr(), tokens, width, self.threads)
+        status = self.rows.pe_geglu(hidden.data_ptr(), self.geglu_buffer.data_ptr(), tokens, width, self.threads,
+                                    self._pool_handle)
         if status:
             raise PackedEncodersError("native CPU GeGLU failed")
         return self.geglu_buffer
@@ -283,7 +323,7 @@ class CPUAttention:
             out = self.norm_buffer
         status = self.rows.pe_add_layer_norm(
             x.data_ptr(), branch.data_ptr(), norm.weight.data_ptr(), None if norm.bias is None else norm.bias.data_ptr(),
-            out.data_ptr(), shape[1], shape[2], norm.eps, self.threads,
+            out.data_ptr(), shape[1], shape[2], norm.eps, self.threads, self._pool_handle,
         )
         if status:
             raise PackedEncodersError("native CPU residual LayerNorm failed")
@@ -332,8 +372,8 @@ class CPUAttention:
             self.output = torch.empty(shape, dtype=torch.float32)
         args = (
             q.data_ptr(), k.data_ptr(), v.data_ptr(), self.output.data_ptr(), boundaries.data_ptr(),
-            tokens, heads, len(lengths), self.tile, half, direct, workers, self.scratch.data_ptr(),
-            self.scratch.numel(),
+            tokens, heads, len(lengths), self.tile, half, direct, workers, self._pool_handle,
+            self.scratch.data_ptr(), self.scratch.numel(),
         )
         return self.output, args
 
@@ -358,6 +398,9 @@ class CPUAttention:
         if self.sme is not None:
             self.sme.close()
             self.sme = None
+        if self.pool is not None:
+            self.pool.close()
+            self.pool = None
         self.output = self.scratch = None
         self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
         self.linear_buffers = {}

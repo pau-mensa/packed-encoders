@@ -1,4 +1,4 @@
-"""SME2 FP32 GEMM numerics, bounded native accesses, and prepared-weight and worker lifecycle."""
+"""SME2 FP32 GEMM numerics, bounded native accesses, prepared-weight lifecycle and the engine worker pool."""
 import ctypes
 import gc
 import os
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 import packed_encoders as pe
 from packed_encoders.cpu import sme
-from packed_encoders.cpu.attention import CPUAttention
+from packed_encoders.cpu.attention import CPUAttention, WorkerPool, _library as attention_library
 from transformers import ModernBertConfig, ModernBertModel
 
 
@@ -50,15 +50,22 @@ def native():
     return lib
 
 
+@pytest.fixture
+def rows(native):
+    lib, _ = attention_library()
+    return lib
+
+
 @torch.no_grad()
-def test_fp32_tiles_workers_and_row_boundaries(native):
+def test_fp32_tiles_workers_and_row_boundaries(rows):
     rng = torch.Generator().manual_seed(713)
+    pool = WorkerPool(rows, 8)
     for m, n, k in ((1, 64, 4), (7, 128, 68), (15, 192, 128), (16, 768, 1152),
                     (17, 128, 128), (31, 768, 768), (32, 2304, 768), (33, 128, 128),
                     (48, 768, 128), (64, 768, 768), (65, 128, 128), (128, 768, 1152), (256, 128, 128),
                     (512, 128, 1028), (545, 192, 260), (1100, 128, 68)):
         x, w = torch.randn(m, k, generator=rng), torch.randn(n, k, generator=rng) * .05
-        projections = sme.FP32Projections([(w, None)], threads=8)
+        projections = sme.FP32Projections([(w, None)], threads=8, pool=pool)
         projections.min_rows = 1  # Exercise the native body even though runtime dispatch prefers Accelerate at M=1.
         reference = F.linear(x.double(), w.double())
         first = None
@@ -73,17 +80,18 @@ def test_fp32_tiles_workers_and_row_boundaries(native):
             row = m // 2
             assert torch.equal(projections.linear(x[row:row + 1], w, None, workers)[0], first[row])
         projections.close()
+    pool.close()
 
 
 @torch.no_grad()
-def test_native_rejects_invalid_metadata_and_preserves_guards(native):
+def test_native_rejects_invalid_metadata_and_preserves_guards(native, rows):
     fn = native.pe_sme_fp32_linear
-    pool = native.pe_sme_fp32_pool(8, 0)
-    assert pool and not native.pe_sme_fp32_pool(0, 0) and not native.pe_sme_fp32_pool(17, 0)
+    pool = rows.pe_pool(8, 0, 0)
+    assert pool and not any(rows.pe_pool(*bad) for bad in ((0, 0, 0), (17, 0, 0), (2, -1, 0), (2, 0, -1)))
     try:
         for m, n, k, workers in ((0, 64, 4, 1), (4097, 64, 4, 1), (1, 63, 4, 1), (1, 64, 5, 1), (1, 64, 4, 0)):
             assert fn(pool, None, None, None, None, m, n, k, workers, 0) != 0
-        for handle in (pool, None):  # Without a pool, the caller computes alone.
+        for handle in (pool, None):  # Without a pool, GCD runs the workers.
             for m in (1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 127, 128, 256, 545):
                 k, n = 68, 128
                 x, w = torch.randn(m, k), torch.randn(n, k)
@@ -97,16 +105,17 @@ def test_native_rejects_invalid_metadata_and_preserves_guards(native):
                 assert fn(*args, needed) == 0
                 assert (out[m * n:] == 12345.).all() and (scratch[needed:] == 12345.).all()
     finally:
-        native.pe_sme_fp32_pool_free(pool)
+        rows.pe_pool_free(pool)
 
 
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
 @torch.no_grad()
-def test_worker_pool_is_released_and_fork_safe(native):
-    baseline = native.pe_sme_fp32_pool_threads()
+def test_worker_pool_is_released_and_fork_safe(rows):
+    baseline = rows.pe_pool_threads()
     w, x = torch.randn(128, 128), torch.randn(1, 64, 128)
-    projections = sme.FP32Projections([(w, None)], threads=4)
-    assert native.pe_sme_fp32_pool_threads() == baseline + 3
+    pool = WorkerPool(rows, 4)
+    assert rows.pe_pool_threads() == baseline + 3
+    projections = sme.FP32Projections([(w, None)], threads=4, pool=pool)
     expected = projections.linear(x, w, None, 4).clone()
     pid = os.fork()
     if pid == 0:  # The child has no pool threads: it must compute alone instead of waiting for them.
@@ -118,12 +127,14 @@ def test_worker_pool_is_released_and_fork_safe(native):
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)
     assert done[0] == pid and os.waitstatus_to_exitcode(done[1]) == 0
+    pool.close()
+    assert pool.handle is None and rows.pe_pool_threads() == baseline
+    assert torch.equal(projections.linear(x, w, None, 4), expected)  # A closed pool leaves GCD.
     projections.close()
-    assert projections.pool is None and native.pe_sme_fp32_pool_threads() == baseline
-    sme.FP32Projections([(w, None)], threads=8)  # Dropped without close: the finalizer joins its workers.
+    assert projections.pool is None
+    WorkerPool(rows, 8)  # Dropped without close: the finalizer joins its workers.
     gc.collect()
-    assert native.pe_sme_fp32_pool_threads() == baseline
-    assert sme.FP32Projections([(w, None)], threads=1).pool is None
+    assert rows.pe_pool_threads() == baseline
 
 
 @torch.no_grad()
@@ -201,10 +212,11 @@ def test_model_short_long_updates_fallbacks_and_unpack(native):
             weight.mul_(.9)
         torch.testing.assert_close(model(ids).last_hidden_state, original(ids).last_hidden_state, atol=2e-5, rtol=2e-5)
         assert model(ids, output_hidden_states=True).hidden_states is not None
-        cache = engine.attention.sme
-        assert cache.pool is not None
+        cache, pool = engine.attention.sme, engine.attention.pool
+        assert pool is not None and cache.pool is pool
         pe.unpack(model)
         assert not cache.weights and not cache.outputs and cache.scratch is None and cache.pool is None
+        assert engine.attention.pool is None and pool.handle is None
         assert model.forward == original
         pe.pack(model, engine=pe.ModernBertCPU(prepack_weights=False))
         assert pe.get_engine(model).attention.sme is None
@@ -217,7 +229,36 @@ def test_model_short_long_updates_fallbacks_and_unpack(native):
 
 
 @torch.no_grad()
-def test_pack_validation_exercises_sme_and_rolls_back(native, monkeypatch):
+def test_pool_results_do_not_depend_on_which_threads_run_tasks(native, monkeypatch):
+    """Spinning helpers on efficiency cores sit out the attention and row kernels. Counting every
+    CPU as an efficiency core leaves those kernels to the caller; results stay bitwise identical."""
+    old_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        torch.manual_seed(712)
+        model = ModernBertModel(ModernBertConfig(vocab_size=64, hidden_size=128, intermediate_size=192,
+                                               num_attention_heads=2, num_hidden_layers=3,
+                                               max_position_embeddings=512, pad_token_id=0)).eval()
+        lengths = (3, 17, 64, 129, 300)
+        ids = torch.cat([torch.arange(n) % 61 + 1 for n in lengths])
+        outputs = []
+        for efficiency in (None, 64):
+            if efficiency is not None:
+                sysctl = sme._sysctl_int
+                monkeypatch.setattr(sme, "_sysctl_int", lambda name: efficiency if name == b"hw.perflevel1.logicalcpu"
+                                    else sysctl(name))
+            pe.pack(model, engine=pe.ModernBertCPU(threads=4), attention_backend="native")
+            engine = pe.get_engine(model)
+            assert engine.attention.pool is not None
+            outputs.append(engine.forward_packed(pe.PackedBatch(ids, host_lengths=lengths)).clone())
+            pe.unpack(model)
+        assert torch.equal(*outputs)
+    finally:
+        torch.set_num_threads(old_threads)
+
+
+@torch.no_grad()
+def test_pack_validation_exercises_sme_and_rolls_back(native, rows, monkeypatch):
     model = ModernBertModel(ModernBertConfig(vocab_size=64, hidden_size=128, intermediate_size=192,
                                            num_attention_heads=2, num_hidden_layers=3,
                                            max_position_embeddings=256, pad_token_id=0)).eval()
@@ -229,11 +270,11 @@ def test_pack_validation_exercises_sme_and_rolls_back(native, monkeypatch):
         return None if out is None else out + 1
 
     monkeypatch.setattr(sme.FP32Projections, "linear", broken)
-    threads = native.pe_sme_fp32_pool_threads()
+    threads = rows.pe_pool_threads()
     with pytest.raises(pe.ValidationError, match="validation failed"):
         pe.pack(model, engine=pe.ModernBertCPU(threads=4), attention_backend="native")
     assert model.forward == original
-    assert native.pe_sme_fp32_pool_threads() == threads  # Rollback stops the worker pool.
+    assert rows.pe_pool_threads() == threads  # Rollback stops the worker pool.
 
 
 @torch.no_grad()

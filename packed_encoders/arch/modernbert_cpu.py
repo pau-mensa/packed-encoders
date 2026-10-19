@@ -102,8 +102,9 @@ class ModernBertCPU:
 
     On SME2-capable Apple Silicon, ``prepack_weights=True`` prepares FP32 SME weight copies
     (about 421 MiB extra for ModernBERT-base), used up to 128 packed tokens on one thread and
-    up to 1,024 or 4,096 with more threads; with ``threads`` above one they run on
-    an engine-owned worker pool. Ordinary in-place updates refresh the copies. Disable it
+    up to 1,024 or 4,096 with more threads; with ``threads`` above one they, native attention
+    and the row kernels run on an engine-owned worker pool (otherwise GCD). Ordinary in-place
+    updates refresh the copies. Disable it
     to retain Accelerate and save memory. Other CPUs and int8 do not prepare these FP32 copies.
     """
     name = "modernbert-cpu"
