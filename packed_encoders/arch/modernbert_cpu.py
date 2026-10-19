@@ -101,9 +101,10 @@ class ModernBertCPU:
     CPU affinity; tuning adds setup time and never runs during inference.
 
     On SME2-capable Apple Silicon, ``prepack_weights=True`` prepares FP32 SME weight copies
-    for short inputs (about 421 MiB extra for ModernBERT-base). Ordinary in-place
-    updates refresh the copies. Disable it to retain Accelerate and save memory.
-    Other CPUs and int8 do not prepare these FP32 copies.
+    (about 421 MiB extra for ModernBERT-base), used up to 128 packed tokens on one thread and
+    up to 1,024 or 4,096 with more threads; with ``threads`` above one they run on
+    an engine-owned worker pool. Ordinary in-place updates refresh the copies. Disable it
+    to retain Accelerate and save memory. Other CPUs and int8 do not prepare these FP32 copies.
     """
     name = "modernbert-cpu"
     adapters = (CPUAdapter(),)
@@ -410,10 +411,10 @@ class PackedModernBertCPU:
             lengths = (min(7, self.max_position, self.max_tokens), min(129, self.max_position, self.max_tokens))
             cases = [lengths]
             if self.attention.sme is not None and self.attention.sme.weights:
-                # The ordinary ragged check exceeds SME's short-input dispatch limit.
-                # Exercise its register tiles, row-block loop, and selected dispatch boundary.
+                # One ragged call may exceed SME's dispatch limit. Exercise its register tiles,
+                # row-block loop, and (within that limit) the 512-row tile groups.
                 cases.extend((min(n, self.max_position, self.max_tokens),)
-                             for n in (16, 32, self.attention.sme.max_rows))
+                             for n in (16, 32, min(self.attention.sme.max_rows, 545)))
             ids = torch.randint(self.model.config.vocab_size, (2, max(map(max, cases))),
                                 generator=torch.Generator().manual_seed(17))
             reports = []
