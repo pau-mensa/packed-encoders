@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from packed_encoders.cpu.attention import _openmp_runtime
+from packed_encoders.cpu.sme import sme2_available
 from packed_encoders.errors import PackedEncodersError, UnsupportedTargetError
 
 _P, _I, _F = ctypes.c_void_p, ctypes.c_int, ctypes.c_float
@@ -53,14 +54,6 @@ class _Buffers(ctypes.Structure):
     _fields_ = [("cos", _P * 2), ("sin", _P * 2), ("rope", _P), ("residual", _P), ("out", _P),
                 ("a_hidden", _P), ("a_width", _P), ("c", _P), ("scales", _P), ("scratch", _P),
                 ("scratch_floats", ctypes.c_long), ("scratch_workers", _I)]
-
-
-def sme2_available():
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
-        return False
-    value, size = ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
-    status = ctypes.CDLL(None).sysctlbyname(b"hw.optional.arm.FEAT_SME2", ctypes.byref(value), ctypes.byref(size), None, 0)
-    return status == 0 and value.value == 1
 
 
 def vnni_available():

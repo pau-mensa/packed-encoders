@@ -66,7 +66,7 @@ jobs:
           python-version: "3.12"
           activate-environment: true
       - run: uv pip install --no-sources --torch-backend cpu -e . pytest
-      - run: python -c 'import signal, pytest; signal.alarm(60); raise SystemExit(pytest.main(["-q", "tests/test_modernbert_cpu.py", "tests/test_registry.py"]))'
+      - run: python -c 'import signal, pytest; signal.alarm(60); raise SystemExit(pytest.main(["-q", "tests/test_modernbert_cpu.py", "tests/test_cpu_sme.py", "tests/test_registry.py"]))'
 
   lock:
     name: Installation lock and wheel

@@ -79,10 +79,10 @@ class CPUAdapter:
 
 class ModernBertCPU:
     """CPU configuration. Thread count controls the native kernels' workers
-    (attention, row kernels, x86 FP32 projections and int8 projections); it
+    (attention, row kernels, native FP32 projections and int8 projections); it
     defaults to PyTorch's thread count at packing.
 
-    Other matrix operations (Apple FP32 projections, SDPA) use PyTorch/Accelerate's
+    Other matrix operations (unprepared Apple FP32 projections, SDPA) use PyTorch/Accelerate's
     existing thread settings. This engine never changes process-global threading
     configuration.
 
@@ -99,11 +99,17 @@ class ModernBertCPU:
     packing, using the model's live weights at 16/32/256 tokens and the configured
     thread count. Other lengths use cache-aware selection. Repack after changing
     CPU affinity; tuning adds setup time and never runs during inference.
+
+    On SME2-capable Apple Silicon, ``prepack_weights=True`` prepares FP32 SME weight copies
+    for short inputs (about 421 MiB extra for ModernBERT-base). Ordinary in-place
+    updates refresh the copies. Disable it to retain Accelerate and save memory.
+    Other CPUs and int8 do not prepare these FP32 copies.
     """
     name = "modernbert-cpu"
     adapters = (CPUAdapter(),)
 
-    def __init__(self, *, threads=None, max_tokens=32768, rehome_weights=False, tune_gemm=False):
+    def __init__(self, *, threads=None, max_tokens=32768, rehome_weights=False, tune_gemm=False,
+                 prepack_weights=True):
         if threads is not None and (type(threads) is not int or threads <= 0):
             raise ValueError("threads must be a positive integer")
         if type(max_tokens) is not int or max_tokens <= 0:
@@ -112,8 +118,11 @@ class ModernBertCPU:
             raise ValueError("rehome_weights must be a bool")
         if type(tune_gemm) is not bool:
             raise ValueError("tune_gemm must be a bool")
+        if type(prepack_weights) is not bool:
+            raise ValueError("prepack_weights must be a bool")
         self.threads, self.max_tokens, self.rehome_weights = threads, max_tokens, rehome_weights
         self.tune_gemm = tune_gemm
+        self.prepack_weights = prepack_weights
 
     def prepare(self, binding, options):
         _options(options)
@@ -213,6 +222,8 @@ class PackedModernBertCPU:
             except Int8Unavailable as exc:
                 warnings.warn(f"{exc}; using exact FP32", stacklevel=4)
         self.precision = self.state.precision = "fp32" if self.int8 is None else "int8"
+        if engine.prepack_weights and self.precision == "fp32" and min(self.max_tokens, self.max_position) > 1:
+            self.attention.prepare_sme([projection for layer in self.plan for projection in layer[1:5]])
         if engine.tune_gemm and self.precision == "fp32":
             self.attention.tune_linear([projection for layer in self.plan for projection in layer[1:5]],
                                        self.max_tokens)
@@ -397,31 +408,45 @@ class PackedModernBertCPU:
             self._check()
             states = [(module, module.training) for module in self.model.modules()]
             lengths = (min(7, self.max_position, self.max_tokens), min(129, self.max_position, self.max_tokens))
-            ids = torch.randint(self.model.config.vocab_size, (2, max(lengths)), generator=torch.Generator().manual_seed(17))
-            mask = torch.arange(ids.shape[1])[None] < torch.tensor(lengths)[:, None]
+            cases = [lengths]
+            if self.attention.sme is not None and self.attention.sme.weights:
+                # The ordinary ragged check exceeds SME's short-input dispatch limit.
+                # Exercise its register tiles, row-block loop, and selected dispatch boundary.
+                cases.extend((min(n, self.max_position, self.max_tokens),)
+                             for n in (16, 32, self.attention.sme.max_rows))
+            ids = torch.randint(self.model.config.vocab_size, (2, max(map(max, cases))),
+                                generator=torch.Generator().manual_seed(17))
+            reports = []
             try:
                 self.model.eval()
                 with torch.no_grad(), torch.autocast("cpu", enabled=False):
-                    reference = self.original_forward(input_ids=ids, attention_mask=mask, return_dict=True).last_hidden_state[mask]
-                    actual = self._packed(ids[mask], lengths, mask.nonzero()[:, 1])
-                    diff = actual - reference
-                    cosine = F.cosine_similarity(actual, reference, dim=-1)
-                    cosine = torch.where((actual.norm(dim=-1) == 0) & (reference.norm(dim=-1) == 0), 1., cosine)
-                    report = CPUValidationReport(self.attention.backend, float(cosine.min()),
-                                                 float(diff.norm() / reference.norm().clamp_min(1e-12)),
-                                                 float(diff.abs().max()), lengths, self.precision,
-                                                 float(cosine.median()))
-                    # int8 cannot meet FP32 bounds: a few bistable tokens flip under any int8,
-                    # so its gate bounds the median token and the overall error instead.
-                    if self.precision == "fp32":
-                        failed = report.min_cosine < 0.99999 or report.relative_l2 > 2e-4
-                    else:
-                        failed = report.median_cosine < INT8_MEDIAN_COSINE or report.relative_l2 > INT8_RELATIVE_L2
-                    if not torch.isfinite(actual).all() or failed:
-                        raise ValidationError(f"CPU ModernBERT output validation failed: {report}")
+                    for case in dict.fromkeys(cases):
+                        inputs = ids[:len(case), :max(case)]
+                        mask = torch.arange(inputs.shape[1])[None] < torch.tensor(case)[:, None]
+                        reference = self.original_forward(input_ids=inputs, attention_mask=mask, return_dict=True).last_hidden_state[mask]
+                        actual = self._packed(inputs[mask], case, mask.nonzero()[:, 1])
+                        diff = actual - reference
+                        cosine = F.cosine_similarity(actual, reference, dim=-1)
+                        cosine = torch.where((actual.norm(dim=-1) == 0) & (reference.norm(dim=-1) == 0), 1., cosine)
+                        report = CPUValidationReport(self.attention.backend, float(cosine.min()),
+                                                     float(diff.norm() / reference.norm().clamp_min(1e-12)),
+                                                     float(diff.abs().max()), case, self.precision,
+                                                     float(cosine.median()))
+                        # int8 bounds typical-token cosine and overall error; FP32 bounds every token.
+                        if self.precision == "fp32":
+                            failed = report.min_cosine < 0.99999 or report.relative_l2 > 2e-4
+                        else:
+                            failed = report.median_cosine < INT8_MEDIAN_COSINE or report.relative_l2 > INT8_RELATIVE_L2
+                        if not torch.isfinite(actual).all() or failed:
+                            raise ValidationError(f"CPU ModernBERT output validation failed: {report}")
+                        reports.append(report)
             finally:
                 for module, training in states:
                     module.training = training
+            report = CPUValidationReport(self.attention.backend, min(r.min_cosine for r in reports),
+                                         max(r.relative_l2 for r in reports), max(r.max_abs for r in reports),
+                                         tuple(n for r in reports for n in r.sequence_lengths), self.precision,
+                                         min(r.median_cosine for r in reports))
             self.state.validation_report = report
             return ValidationResult("modernbert-cpu", report)
 

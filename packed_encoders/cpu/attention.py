@@ -1,6 +1,4 @@
-"""Bounded CPU attention with an optional Apple Accelerate implementation, native row kernels
-(RoPE/layout, GeGLU, residual LayerNorm) on Apple and Linux x86-64, and native FP32 projections on
-Linux x86-64."""
+"""CPU attention/row kernels, x86 FP32 GEMM, and prepared Apple SME2 FP32 projections."""
 
 from __future__ import annotations
 
@@ -159,10 +157,21 @@ class CPUAttention:
         # of a head-major result they would transpose into a copy.
         self.token_major = self.library is not None
         # x86 projections: MKL does not pick its AVX-512 kernels on AMD; the native GEMM reads the
-        # original weights (Apple keeps Accelerate through F.linear).
+        # original weights (unprepared Apple projections keep Accelerate through F.linear).
         self.native_linear = self.rows is not None and x86 and hasattr(self.rows, "pe_linear")
         self.linear_l1_bytes = l1_data_cache_bytes() if self.native_linear else None
         self.linear_tiles, self.linear_tuning = {}, {}
+        self.sme = None
+
+    def prepare_sme(self, projections):
+        from packed_encoders.cpu.sme import FP32Projections, sme2_available
+        if self.rows is None or not sme2_available():
+            return
+        try:
+            prepared = FP32Projections(projections, self.threads)
+            self.sme = prepared if prepared.weights else None
+        except PackedEncodersError as exc:
+            warnings.warn(str(exc), stacklevel=3)
 
     def tune_linear(self, projections, max_tokens):
         if self.native_linear:
@@ -205,6 +214,10 @@ class CPUAttention:
         each result before the next projection of that width (requests never fault in fresh GEMM
         outputs).
         """
+        if self.sme is not None:
+            out = self.sme.linear(x, weight, bias, self.threads)
+            if out is not None:
+                return out
         n, k = weight.shape
         if not self.native_linear or x.dtype != torch.float32 or x.shape[-1] != k or not x.is_contiguous():
             return F.linear(x, weight, bias)
@@ -342,6 +355,9 @@ class CPUAttention:
         return out
 
     def close(self):
+        if self.sme is not None:
+            self.sme.close()
+            self.sme = None
         self.output = self.scratch = None
         self.rope_buffer = self.geglu_buffer = self.norm_buffer = None
         self.linear_buffers = {}
