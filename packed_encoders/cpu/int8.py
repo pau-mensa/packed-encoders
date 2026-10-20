@@ -274,7 +274,10 @@ class Int8Projections:
                 if corrections is not None:
                     corrections[index] = 128 * q.sum(-1, dtype=torch.int32)
 
-        with ThreadPoolExecutor(min(4, self.workers)) as pool:
+        # On x86, each factor already uses the configured BLAS workers. One task at a time
+        # lowers peak memory without slowing packing on Zen 5/MKL, and still overlaps the
+        # next factor with GPTQ. Accelerate benefits from concurrent factors on Apple.
+        with ThreadPoolExecutor(1 if self.x86 else min(4, self.workers)) as pool:
             _calibrate(engine, plan, quantize)
         self.signs = (signs(hidden, block_hidden).float(), signs(width, block_width).float())
         self.geometry = _Model(hidden, heads, width, block_hidden, block_width,

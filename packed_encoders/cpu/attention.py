@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from functools import lru_cache
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -89,10 +91,21 @@ def _x86_library():
                 "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-Wno-psabi", "-c"]
     sources = (("rows.c", "-ffp-contract=off"), ("local_attention_x86.c", "-ffp-contract=fast"),
                ("gemm_x86.c", "-ffp-contract=fast"))
+
+    def compile_source(source):
+        name, contract = source
+        subprocess.run([*compile_, contract, str(here / name), "-o", str(out / f"{name}.o")],
+                       check=True, capture_output=True, timeout=60)
+
     try:
-        for name, contract in sources:
-            subprocess.run([*compile_, contract, str(here / name), "-o", str(out / f"{name}.o")],
-                           check=True, capture_output=True, timeout=60)
+        workers = min(len(sources), len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        workers = min(len(sources), os.cpu_count() or 1)
+    try:
+        # Independent objects can compile together. Join every compiler before linking or,
+        # on failure, removing the temporary directory another compiler may still be using.
+        with ThreadPoolExecutor(workers) as pool:
+            list(pool.map(compile_source, sources))
         subprocess.run([compiler, "-shared", *(str(out / f"{name}.o") for name, _ in sources), runtime,
                         f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(out / "native.so")],
                        check=True, capture_output=True, timeout=60)
