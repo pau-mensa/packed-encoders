@@ -117,12 +117,24 @@ def signs(k, block):
     return torch.randint(0, 2, (k,), generator=generator).double() * 2 - 1
 
 
-def rotation(k, block):
-    """Orthogonal R with x·R = H_block(signs·x) / sqrt(block) per block (Sylvester order)."""
+def hadamard(block):
+    """The orthonormal Sylvester-order Hadamard matrix of size block (float64)."""
     h = torch.ones(1, 1, dtype=torch.float64)
     while h.shape[0] < block:
         h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)])
-    return torch.block_diag(*[h / block ** .5] * (k // block)) * signs(k, block)[:, None]
+    return h / block ** .5
+
+
+def rotation(k, block):
+    """Orthogonal R with x·R = H_block(signs·x) / sqrt(block) per block (Sylvester order)."""
+    return torch.block_diag(*[hadamard(block)] * (k // block)) * signs(k, block)[:, None]
+
+
+def rotate(x, k, block):
+    """x·rotation(k, block) for float64 x [..., k], one Hadamard block at a time rather than
+    through the dense k x k matrix: the same products, block / k of the work. Pass contiguous
+    x: on a transposed view the product takes a copying path that costs more than the product."""
+    return ((x * signs(k, block)).unflatten(-1, (k // block, block)) @ hadamard(block)).flatten(-2)
 
 
 def pack_weights(q, lanes=64):
@@ -217,12 +229,11 @@ class Int8Projections:
         # parameters' version counters.
         self.weights = [weight for layer in engine.plan for weight, _ in layer[1:5]]
         block_hidden, block_width = (128 if hidden % 128 == 0 else 64), (128 if width % 128 == 0 else 64)
-        r_hidden, r_width, r_heads = rotation(hidden, block_hidden), rotation(width, block_width), rotation(hidden, 64)
         grams = _calibrate(engine, self.weights)
-        # Runtime inputs are x·A for an orthogonal A, so W·A gives the same products and
-        # A^T·H·A is the Gram matrix of the rotated inputs. The context arrives rotated per
-        # head (V·R_heads), so Wo's input needs no runtime rotation.
-        inputs = (r_hidden, r_heads, r_hidden, r_width)
+        # Runtime inputs are x·A for an orthogonal A = rotation(k, block), so W·A gives the same
+        # products and A^T·H·A is the Gram matrix of the rotated inputs. The context arrives
+        # rotated per head (V·R_heads), so Wo's input needs no runtime rotation.
+        inputs = ((hidden, block_hidden), (hidden, 64), (hidden, block_hidden), (width, block_width))
         # Per projection kind: packed weights, scales and (x86) corrections for every layer. x86
         # multiplies u8 = q + 128 activations: its products carry 128 * sum_k w[n][k].
         lanes = 16 if self.x86 else 64
@@ -235,13 +246,13 @@ class Int8Projections:
         with ThreadPoolExecutor(min(4, self.workers)) as pool:
             for index, layer in enumerate(linears):
                 weights, hessians = [], []
-                for kind, a in enumerate(inputs):
+                for kind, (k, block) in enumerate(inputs):
                     w = layer[kind].weight.detach().double()
-                    if kind == 0:
+                    if kind == 0:  # R_heads^T·Wv = (Wv^T·R_heads)^T
                         w = w.clone()
-                        w[2 * hidden:] = r_heads.T @ w[2 * hidden:]
-                    weights.append((w @ a).float())
-                    hessians.append(a.T @ grams[4 * index + kind] @ a)
+                        w[2 * hidden:] = rotate(w[2 * hidden:].T.contiguous(), hidden, 64).T
+                    weights.append(rotate(w, k, block).float())
+                    hessians.append(rotate(rotate(grams[4 * index + kind], k, block).T.contiguous(), k, block).T)
                     grams[4 * index + kind] = None
                 for (packed, scales, corrections), w, factor in zip(self.prepared, weights,
                                                                    pool.map(inverse_factor, hessians)):

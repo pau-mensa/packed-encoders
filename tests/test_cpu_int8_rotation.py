@@ -1,8 +1,9 @@
-"""FP32 butterfly order and exact activation quantization on the x86 int8 path."""
+"""FP32 butterfly order and exact activation quantization on the x86 int8 path, and the
+pack-time block rotations."""
 import pytest
 import torch
 
-from packed_encoders.cpu.int8 import library, signs, vnni_available
+from packed_encoders.cpu.int8 import library, rotate, rotation, signs, vnni_available
 
 
 @pytest.fixture(scope='module')
@@ -50,3 +51,17 @@ def test_rotation_and_quantization_match_ordered_fp32(quantize, block):
             assert torch.equal(scale.view(torch.int32), expected_scale.view(torch.int32)), (m, k, block)
             if block:
                 assert torch.equal(tmp.view(torch.int32), rotated[-1].view(torch.int32)), (m, k, block)
+
+
+@pytest.mark.parametrize('k, block', [(768, 128), (768, 64), (1152, 128), (192, 64)])
+def test_block_rotation_matches_dense(k, block):
+    # Packing's three products: W·R, R^T·W (the Wv fold) and R^T·G·R (the Hessians). The block
+    # products are the dense ones in another summation order, so they agree to float64 rounding.
+    rng = torch.Generator().manual_seed(k + block)
+    w = torch.randn(48, k, generator=rng, dtype=torch.float64)
+    x = torch.randn(2 * k, k, generator=rng, dtype=torch.float64)
+    g, r = x.T @ x, rotation(k, block)
+    for got, want in ((rotate(w, k, block), w @ r),
+                      (rotate(x, k, block).T, r.T @ x.T),
+                      (rotate(rotate(g, k, block).T.contiguous(), k, block).T, r.T @ g @ r)):
+        torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12 * float(want.abs().max()))
