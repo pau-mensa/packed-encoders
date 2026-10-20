@@ -178,13 +178,23 @@ def gptq(library, weight, factor, workers, block=128):
     return q, scale
 
 
-def _calibrate(engine, projections):
-    """Input Gram matrices per projection from FP32 forwards over random token IDs."""
-    grams = {id(weight): torch.zeros(weight.shape[1], weight.shape[1], dtype=torch.float64) for weight in projections}
+def _calibrate(engine, layers, layer_done):
+    """An FP32 forward over random token IDs that records the input Gram matrix of every
+    projection. Once all of layers[i]'s projections have run, layer_done(i, grams) receives their
+    matrices in order, so only one layer's exist at a time. They stay FP32: each projection runs
+    once, on the whole batch, so its FP32 product is the float64 sum exactly, in half the memory."""
+    slots = {id(weight): (index, kind) for index, weights in enumerate(layers) for kind, weight in enumerate(weights)}
+    pending = {}
 
     def record(x, weight, bias=None):
+        if id(weight) not in slots:
+            raise PackedEncodersError("int8 calibration ran a projection more than once")
+        index, kind = slots.pop(id(weight))
         rows = x.reshape(-1, weight.shape[1])
-        grams[id(weight)] += (rows.T @ rows).double()
+        grams = pending.setdefault(index, [None] * len(layers[index]))
+        grams[kind] = rows.T @ rows
+        if all(gram is not None for gram in grams):
+            layer_done(index, pending.pop(index))
         return F.linear(x, weight, bias)
 
     # One batch regardless of max_tokens, so the prepared weights depend only on the model.
@@ -199,7 +209,8 @@ def _calibrate(engine, projections):
     finally:
         for module, training in states:
             module.training = training
-    return [grams[id(weight)] for weight in projections]
+    if slots:
+        raise PackedEncodersError("int8 calibration did not run every projection")
 
 
 class Int8Projections:
@@ -227,9 +238,9 @@ class Int8Projections:
         self.engine, self.workers = engine, engine.attention.threads
         # The engine's aliases: _core passes these to calibration, and they share the
         # parameters' version counters.
-        self.weights = [weight for layer in engine.plan for weight, _ in layer[1:5]]
+        plan = [tuple(weight for weight, _ in layer[1:5]) for layer in engine.plan]
+        self.weights = sum(plan, ())
         block_hidden, block_width = (128 if hidden % 128 == 0 else 64), (128 if width % 128 == 0 else 64)
-        grams = _calibrate(engine, self.weights)
         # Runtime inputs are x·A for an orthogonal A = rotation(k, block), so W·A gives the same
         # products and A^T·H·A is the Gram matrix of the rotated inputs. The context arrives
         # rotated per head (V·R_heads), so Wo's input needs no runtime rotation.
@@ -241,25 +252,29 @@ class Int8Projections:
                           torch.empty(len(layers), n),
                           torch.empty(len(layers), n, dtype=torch.int32) if self.x86 else None)
                          for n, k in (linear.weight.shape for linear in linears[0])]
-        # One layer at a time, so only its rotated weights and Hessians exist at once, and each
-        # Gram matrix is released after use.
+
+        def quantize(index, grams):
+            # Calibration calls this as soon as layer index has run, so only this layer's Gram
+            # matrices, rotated weights and Hessians exist at once; each Gram matrix is released
+            # after use.
+            weights, hessians = [], []
+            for kind, ((k, block), linear) in enumerate(zip(inputs, linears[index])):
+                w = linear.weight.detach().double()
+                if kind == 0:  # R_heads^T·Wv = (Wv^T·R_heads)^T
+                    w = w.clone()
+                    w[2 * hidden:] = rotate(w[2 * hidden:].T.contiguous(), hidden, 64).T
+                weights.append(rotate(w, k, block).float())
+                hessians.append(rotate(rotate(grams[kind].double(), k, block).T.contiguous(), k, block).T)
+                grams[kind] = None
+            for (packed, scales, corrections), w, factor in zip(self.prepared, weights,
+                                                               pool.map(inverse_factor, hessians)):
+                q, scales[index] = gptq(self.library, w, factor, self.workers)
+                packed[index] = pack_weights(q, lanes)
+                if corrections is not None:
+                    corrections[index] = 128 * q.sum(-1, dtype=torch.int32)
+
         with ThreadPoolExecutor(min(4, self.workers)) as pool:
-            for index, layer in enumerate(linears):
-                weights, hessians = [], []
-                for kind, (k, block) in enumerate(inputs):
-                    w = layer[kind].weight.detach().double()
-                    if kind == 0:  # R_heads^T·Wv = (Wv^T·R_heads)^T
-                        w = w.clone()
-                        w[2 * hidden:] = rotate(w[2 * hidden:].T.contiguous(), hidden, 64).T
-                    weights.append(rotate(w, k, block).float())
-                    hessians.append(rotate(rotate(grams[4 * index + kind], k, block).T.contiguous(), k, block).T)
-                    grams[4 * index + kind] = None
-                for (packed, scales, corrections), w, factor in zip(self.prepared, weights,
-                                                                   pool.map(inverse_factor, hessians)):
-                    q, scales[index] = gptq(self.library, w, factor, self.workers)
-                    packed[index] = pack_weights(q, lanes)
-                    if corrections is not None:
-                        corrections[index] = 128 * q.sum(-1, dtype=torch.int32)
+            _calibrate(engine, plan, quantize)
         self.signs = (signs(hidden, block_hidden).float(), signs(width, block_width).float())
         self.geometry = _Model(hidden, heads, width, block_hidden, block_width,
                             self.signs[0].data_ptr(), self.signs[1].data_ptr())

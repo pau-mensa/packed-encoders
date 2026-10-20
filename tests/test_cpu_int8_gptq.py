@@ -1,8 +1,10 @@
-"""The native GPTQ column loop reproduces the batched PyTorch GPTQ it replaced, bit for bit."""
+"""The native GPTQ column loop and the per-layer FP32 calibration Gram matrices reproduce the code
+they replaced, bit for bit."""
 import pytest
 import torch
 
 from packed_encoders.cpu import int8
+from packed_encoders.errors import PackedEncodersError
 
 
 @pytest.fixture(scope='module')
@@ -74,3 +76,44 @@ def test_native_gptq_rejects_bad_blocks(library):
     for args in ((0, 8, 0, 8, 1), (4, 8, 0, 9, 1), (4, 8, 4, 4, 1), (4, 8, 0, 8, 0)):
         assert library.pe_q8_gptq_block(*pointers, *args) == -1
     assert library.pe_q8_gptq_block(*pointers, 4, 8, 0, 8, 2) == 0
+
+
+def test_calibration_hands_over_each_layer_as_it_completes():
+    # Two layers of two projections. Each layer's FP32 Gram matrices arrive as soon as its last
+    # projection has run, before the next layer's first, and equal the float64 sums packing
+    # recorded before. Running a projection twice, or not at all, raises.
+    generator = torch.Generator().manual_seed(5)
+    layers = [(torch.empty(8, 16), torch.empty(8, 24)) for _ in range(2)]
+    calls = [(weight, torch.randn(1, 30, weight.shape[1], generator=generator)) for layer in layers for weight in layer]
+    model = torch.nn.Module()
+    model.embeddings = torch.nn.Module()
+    model.embeddings.tok_embeddings = torch.nn.Embedding(10, 4)
+    events, got = [], {}
+
+    class Engine:
+        max_position = 64
+
+        def __init__(self, calls):
+            self.calls = calls
+
+        def _core(self, ids, lengths, positions, linear):
+            for n, (weight, x) in enumerate(self.calls):
+                events.append(('run', n))
+                linear(x, weight)
+
+    def done(index, grams):
+        events.append(('done', index))
+        got[index] = list(grams)
+
+    Engine.model = model
+    int8._calibrate(Engine(calls), layers, done)
+    assert events == [('run', 0), ('run', 1), ('done', 0), ('run', 2), ('run', 3), ('done', 1)]
+    for n, (weight, x) in enumerate(calls):
+        old = torch.zeros(weight.shape[1], weight.shape[1], dtype=torch.float64)
+        old += (x[0].T @ x[0]).double()
+        gram = got[n // 2][n % 2]
+        assert gram.dtype == torch.float32 and torch.equal(gram.double(), old)
+    with pytest.raises(PackedEncodersError, match='more than once'):
+        int8._calibrate(Engine(calls + calls[:1]), layers, lambda *_: None)
+    with pytest.raises(PackedEncodersError, match='every projection'):
+        int8._calibrate(Engine(calls[:3]), layers, lambda *_: None)
