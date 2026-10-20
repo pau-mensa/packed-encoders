@@ -13,7 +13,8 @@
 //   quantize -> Wmo -> add+norm -> rotate + quantize -> next QKV -> RoPE.
 // The two Apple M4 Pro P-cluster SME units are shared by their cores; workers interleave
 // SME and NEON work. The attention-output rotation is folded into Wv/Wo by Python, so the
-// context is quantized without rotation.
+// context is quantized without rotation. At pack time, Python's GPTQ runs its column loop
+// here too (pe_q8_gptq_block).
 #include <arm_neon.h>
 #include <arm_sme.h>
 #include <dispatch/dispatch.h>
@@ -298,4 +299,35 @@ void pe_q8_quantize(const float *x, int M, int K, const float *signs, int block,
                     int8_t *packed, float *scale) {
     zero_padding(packed, M, K);
     for (int m = 0; m < M; ++m) emit_row(x + (size_t)m * K, K, signs, block, tmp, packed, scale, m);
+}
+
+// ---------------------------------------------------------------- pack-time GPTQ
+typedef struct {
+    float *w;
+    const float *hinv, *scale;
+    int8_t *q;
+    float *errors;
+    int n, k, i1, i2, groups;
+    _Atomic int next;
+} GptqJob;
+
+static void gptq_worker(void *opaque, size_t id) {
+    GptqJob *j = opaque;
+    (void)id;
+    for (int task; (task = atomic_fetch_add_explicit(&j->next, 1, memory_order_relaxed)) < j->groups;)
+        for (int r = task * 16; r < j->n && r < task * 16 + 16; ++r)
+            pe_gptq_row(j->w + (size_t)r * j->k, j->hinv, j->scale[r], j->q + (size_t)r * j->k,
+                        j->errors + (size_t)r * (j->i2 - j->i1), j->k, j->i1, j->i2);
+}
+
+// GPTQ's column loop over columns [i1, i2) of a row-major [n][k] weight copy (int8.py): rows
+// are independent, so workers take groups of 16. errors is [n][i2 - i1].
+int pe_q8_gptq_block(float *w, const float *hinv, const float *scale, int8_t *q, float *errors,
+                     int n, int k, int i1, int i2, int workers) {
+    if (!w || !hinv || !scale || !q || !errors || n < 1 || i1 < 0 || i2 <= i1 || i2 > k || workers < 1) return -1;
+    GptqJob j = {w, hinv, scale, q, errors, n, k, i1, i2, (n + 15) / 16, 0};
+    if (workers > j.groups) workers = j.groups;
+    if (workers == 1) gptq_worker(&j, 0);
+    else dispatch_apply_f(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &j, gptq_worker);
+    return 0;
 }

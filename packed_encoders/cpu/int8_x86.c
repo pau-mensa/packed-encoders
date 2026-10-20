@@ -13,6 +13,7 @@
 // (channel panel, row chunk) pairs, so a single short sequence still spreads over all threads;
 // the row stages (dequantize, residual LayerNorm, GeGLU, rotate + quantize, RoPE) split the rows.
 // Built with contraction off, as rows.c, so the shared row bodies give the same bits as there.
+// At pack time, Python's GPTQ runs its column loop here too (pe_q8_gptq_block).
 #include <immintrin.h>
 #include <math.h>
 #include <omp.h>
@@ -349,4 +350,15 @@ void pe_q8_gemm(const uint8_t *a, const int8_t *w, int32_t *c, int M, int N, int
 void pe_q8_quantize(const float *x, int M, int K, const float *signs, int block, float *tmp, uint8_t *rows,
                     float *scale) {
     for (int r = 0; r < M; ++r) emit_row(x + (size_t)r * K, K, signs, block, tmp, rows + (size_t)r * K, scale + r);
+}
+
+// Pack-time GPTQ: the column loop over columns [i1, i2) of a row-major [n][k] weight copy
+// (int8.py). Rows are independent; errors is [n][i2 - i1].
+int pe_q8_gptq_block(float *w, const float *hinv, const float *scale, int8_t *q, float *errors, int n, int k, int i1,
+                     int i2, int workers) {
+    if (!w || !hinv || !scale || !q || !errors || n < 1 || i1 < 0 || i2 <= i1 || i2 > k || workers < 1) return -1;
+#pragma omp parallel for num_threads(workers) schedule(static, 16) if (workers > 1)
+    for (int r = 0; r < n; ++r)
+        pe_gptq_row(w + (size_t)r * k, hinv, scale[r], q + (size_t)r * k, errors + (size_t)r * (i2 - i1), k, i1, i2);
+    return 0;
 }

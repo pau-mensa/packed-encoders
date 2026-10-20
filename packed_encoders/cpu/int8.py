@@ -12,6 +12,7 @@ needs no data and always produces the same weights. Activations are quantized pe
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from functools import lru_cache
 from operator import attrgetter
@@ -107,6 +108,7 @@ def library():
         fn.argtypes, fn.restype = [_P] * 4 + [_I] * 2, _I
     lib.pe_q8_gemm.argtypes = [_P] * 3 + [_I] * 3
     lib.pe_q8_quantize.argtypes = [_P, _I, _I, _P, _I, _P, _P, _P]
+    lib.pe_q8_gptq_block.argtypes, lib.pe_q8_gptq_block.restype = [_P] * 5 + [_I] * 5, _I
     return lib, directory
 
 
@@ -130,35 +132,38 @@ def pack_weights(q, lanes=64):
     return q.reshape(*lead, n // lanes, lanes, k // 4, 4).transpose(-3, -2).contiguous()
 
 
-def gptq(weights, hessians, block=128, damp=0.01):
-    """Batched GPTQ for [B, N, K] weights and [B, K, K] Hessians: symmetric int8 values and
-    per-row scales (max |w| / 127). Column updates run in FP32 across the whole batch."""
-    w = weights.float().clone()
-    h = hessians.clone()
-    k = w.shape[2]
-    diagonal = torch.diagonal(h, dim1=1, dim2=2)
+def inverse_factor(hessian, damp=0.01):
+    """GPTQ's upper Cholesky factor of the damped inverse of one [K, K] float64 Hessian, as
+    FP32, and the dead (zero-diagonal) columns. One matrix per call: a single factor scales
+    poorly across cores (on an M4 Pro, Accelerate's inverse keeps ~7 busy for 15-30 ms), so
+    callers run a few side by side."""
+    h = hessian.clone()
+    diagonal = torch.diagonal(h)
     dead = diagonal == 0
     diagonal[dead] = 1
-    w.masked_fill_(dead[:, None, :], 0)
-    h += damp * diagonal.mean(1)[:, None, None] * torch.eye(k, dtype=h.dtype)
-    hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(h)), upper=True).float()
-    scale = weights.abs().amax(2).float() / 127
-    safe = torch.where(scale > 0, scale, 1)[:, :, None]
-    scale3 = scale[:, :, None]
-    q = torch.empty_like(w)
+    h += damp * diagonal.mean() * torch.eye(h.shape[0], dtype=h.dtype)
+    return torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(h)), upper=True).float(), dead
+
+
+def gptq(library, weight, factor, workers, block=128):
+    """GPTQ for one FP32 [N, K] weight, given inverse_factor's results: symmetric int8 values
+    and per-row scales (max |w| / 127). The column loop of each block runs natively, row by
+    row; the update of the columns after the block is one FP32 product."""
+    hinv, dead = factor
+    rows = hinv.contiguous()  # the native loop reads factor rows; the product keeps LAPACK's layout
+    w = weight.clone(memory_format=torch.contiguous_format)
+    n, k = w.shape
+    w[:, dead] = 0
+    scale = weight.abs().amax(1) / 127
+    q = torch.empty(n, k, dtype=torch.int8)
     for i1 in range(0, k, block):
         i2 = min(i1 + block, k)
-        w1, hinv1 = w[:, :, i1:i2].clone(), hinv[:, i1:i2, i1:i2]
-        errors = torch.empty_like(w1)
-        for i in range(i2 - i1):
-            column = w1[:, :, i:i + 1]
-            quantized = torch.round(column / safe).clamp_(-127, 127)
-            q[:, :, i1 + i:i1 + i + 1] = quantized
-            error = (column - quantized * scale3) / hinv1[:, i, i][:, None, None]
-            w1[:, :, i:] -= error * hinv1[:, i:i + 1, i:]
-            errors[:, :, i:i + 1] = error
-        w[:, :, i2:] -= errors @ hinv[:, i1:i2, i2:]
-    return q.to(torch.int8), scale
+        errors = torch.empty(n, i2 - i1)
+        if library.pe_q8_gptq_block(w.data_ptr(), rows.data_ptr(), scale.data_ptr(), q.data_ptr(),
+                                    errors.data_ptr(), n, k, i1, i2, workers):
+            raise PackedEncodersError("native int8 GPTQ failed")
+        w[:, i2:] -= errors @ hinv[i1:i2, i2:]
+    return q, scale
 
 
 def _calibrate(engine, projections):
@@ -218,20 +223,32 @@ class Int8Projections:
         # A^T·H·A is the Gram matrix of the rotated inputs. The context arrives rotated per
         # head (V·R_heads), so Wo's input needs no runtime rotation.
         inputs = (r_hidden, r_heads, r_hidden, r_width)
-        self.prepared = []
-        for kind, a in enumerate(inputs):
-            stack, hessians = [], []
+        # Per projection kind: packed weights, scales and (x86) corrections for every layer. x86
+        # multiplies u8 = q + 128 activations: its products carry 128 * sum_k w[n][k].
+        lanes = 16 if self.x86 else 64
+        self.prepared = [(torch.empty(len(layers), n // lanes, k // 4, lanes, 4, dtype=torch.int8),
+                          torch.empty(len(layers), n),
+                          torch.empty(len(layers), n, dtype=torch.int32) if self.x86 else None)
+                         for n, k in (linear.weight.shape for linear in linears[0])]
+        # One layer at a time, so only its rotated weights and Hessians exist at once, and each
+        # Gram matrix is released after use.
+        with ThreadPoolExecutor(min(4, self.workers)) as pool:
             for index, layer in enumerate(linears):
-                w = layer[kind].weight.detach().double()
-                if kind == 0:
-                    w = w.clone()
-                    w[2 * hidden:] = r_heads.T @ w[2 * hidden:]
-                stack.append((w @ a).float())
-                hessians.append(a.T @ grams[4 * index + kind] @ a)
-            q, scale = gptq(torch.stack(stack), torch.stack(hessians))
-            # x86 multiplies u8 = q + 128 activations: its products carry 128 * sum_k w[n][k].
-            correction = (128 * q.sum(-1, dtype=torch.int32)).contiguous() if self.x86 else None
-            self.prepared.append((pack_weights(q, 16 if self.x86 else 64), scale.contiguous(), correction))
+                weights, hessians = [], []
+                for kind, a in enumerate(inputs):
+                    w = layer[kind].weight.detach().double()
+                    if kind == 0:
+                        w = w.clone()
+                        w[2 * hidden:] = r_heads.T @ w[2 * hidden:]
+                    weights.append((w @ a).float())
+                    hessians.append(a.T @ grams[4 * index + kind] @ a)
+                    grams[4 * index + kind] = None
+                for (packed, scales, corrections), w, factor in zip(self.prepared, weights,
+                                                                   pool.map(inverse_factor, hessians)):
+                    q, scales[index] = gptq(self.library, w, factor, self.workers)
+                    packed[index] = pack_weights(q, lanes)
+                    if corrections is not None:
+                        corrections[index] = 128 * q.sum(-1, dtype=torch.int32)
         self.signs = (signs(hidden, block_hidden).float(), signs(width, block_width).float())
         self.geometry = _Model(hidden, heads, width, block_hidden, block_width,
                             self.signs[0].data_ptr(), self.signs[1].data_ptr())

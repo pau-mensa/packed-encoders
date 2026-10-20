@@ -1,6 +1,7 @@
-// Per-row FP32 bodies shared by the native CPU kernels (local_attention.c, int8.c, rows.c).
-// Each function sets its own contraction mode, so including files see the same arithmetic.
-// GCC ignores the clang pragmas; rows.c is built with -ffp-contract=off, so it never contracts.
+// Per-row FP32 bodies shared by the native CPU kernels (local_attention.c, int8.c, rows.c),
+// and the int8 libraries' pack-time GPTQ row. Each function sets its own contraction mode, so
+// including files see the same arithmetic. GCC ignores the clang pragmas; rows.c and
+// int8_x86.c are built with -ffp-contract=off, so they never contract.
 #ifndef PE_ROWS_H
 #define PE_ROWS_H
 
@@ -9,6 +10,7 @@
 #endif
 #include <math.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // One token's split-half RoPE (head_dim 64) and token-major -> head-major layout.
 // `row` is the token's [q | k | v] projection (3 * heads * 64); `out` is [3, heads, tokens, 64].
@@ -135,5 +137,24 @@ static inline void pe_add_norm_row(float *r, const float *b, const float *weight
         }
 }
 #endif
+
+// GPTQ's column loop over columns [i1, i2) of one weight row (int8.py's gptq): each column
+// rounds to a symmetric int8 value at the row's scale, and its error, divided by the diagonal
+// of the upper Cholesky factor hinv ([k][k], row-major), updates the block's later columns.
+// The errors (i2 - i1 of them) feed the caller's update of the columns after the block. These
+// are PyTorch's operations one by one: no contraction, true division, round half to even.
+static inline void pe_gptq_row(float *w, const float *hinv, float scale, int8_t *q, float *errors,
+                               int k, int i1, int i2) {
+#pragma clang fp contract(off)
+    float safe = scale > 0 ? scale : 1.f;
+    for (int i = i1; i < i2; ++i) {
+        const float *h = hinv + (size_t)i * k;
+        float quantized = fminf(fmaxf(rintf(w[i] / safe), -127.f), 127.f);
+        float error = (w[i] - quantized * scale) / h[i];
+        q[i] = (int8_t)quantized;
+        errors[i - i1] = error;
+        for (int j = i + 1; j < i2; ++j) w[j] -= h[j] * error;
+    }
+}
 
 #endif
