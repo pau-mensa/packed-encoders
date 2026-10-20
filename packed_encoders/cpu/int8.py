@@ -30,8 +30,9 @@ from packed_encoders.errors import PackedEncodersError, UnsupportedTargetError
 
 _P, _I, _F = ctypes.c_void_p, ctypes.c_int, ctypes.c_float
 _version = attrgetter("_version")
-# Calibration: 16 rows of up to 384 random tokens (~6K tokens).
-CALIBRATION_ROWS, CALIBRATION_LENGTH = 16, 384
+# Calibration: 16 rows of up to 256 random tokens (4K). 16 x 384 (6K) was no more accurate across
+# seeds, up to 8K-token documents (benchmarks/docs/modernbert-cpu-reduced-precision.md).
+CALIBRATION_ROWS, CALIBRATION_LENGTH = 16, 256
 TABLES = {"full_attention": 0, "sliding_attention": 1}
 
 

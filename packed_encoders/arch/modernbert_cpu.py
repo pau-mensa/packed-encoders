@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import threading
 from types import SimpleNamespace
@@ -185,7 +186,22 @@ class PackedModernBertCPU:
         for param in self.model.parameters():
             if param.device.type != "cpu" or param.dtype != torch.float32 or not param.is_contiguous():
                 raise UnsupportedTargetError("CPU ModernBERT requires contiguous FP32 CPU parameters")
-        self.attention = CPUAttention(backend, self.dim, self.half, engine.threads or torch.get_num_threads())
+        # The projection library (SME FP32 or int8) compiles while CPUAttention compiles its own,
+        # 0.3-0.5 s each; the calls below then find it cached. Failures are left for them to report.
+        projection_library = None
+        if precision == "int8":
+            from packed_encoders.cpu import int8
+            if int8.sme2_available() or int8.vnni_available():
+                projection_library = int8.library
+        elif (engine.prepack_weights and backend != "sdpa" and self.dim == self.half == 64
+              and min(self.max_tokens, self.max_position) > 1):
+            from packed_encoders.cpu import sme
+            if sme.sme2_available():
+                projection_library = sme.library
+        with ThreadPoolExecutor(1) as pool:
+            if projection_library is not None:
+                pool.submit(projection_library)
+            self.attention = CPUAttention(backend, self.dim, self.half, engine.threads or torch.get_num_threads())
         if engine.rehome_weights:  # before the plan takes its aliases
             rehome([param for layer in self.layers
                     for projection in (layer.attn.Wqkv, layer.attn.Wo, layer.mlp.Wi, layer.mlp.Wo)

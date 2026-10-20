@@ -9,7 +9,10 @@
 // before the pool: int8 attention measured 6% slower at 32 tokens with claiming there.
 // Build: clang -O3 -dynamiclib -framework Accelerate local_attention.c pool.c -o attention.dylib
 #define ACCELERATE_NEW_LAPACK
-#include <Accelerate/Accelerate.h>
+// Only the vecLib headers in use: parsing all of Accelerate.h took ~0.3 s of a ~0.5 s build.
+#include <vecLib/cblas_new.h>
+#include <vecLib/vDSP.h>
+#include <vecLib/vForce.h>
 #include <arm_neon.h>
 #include <math.h>
 #include <stdatomic.h>
