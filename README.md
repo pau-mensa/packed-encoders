@@ -120,6 +120,11 @@ For the tested environments and remaining performance checks, see
 
 ## ⚡️ Quick Start
 
+CPU and CUDA retrievers can attach a prepared projection or custom head with
+`pe.get_engine(backbone).with_epilogue(pe.epilogues.TokenProjection(projection))`.
+CPU heads run per packed chunk; CUDA heads run after the existing packed forward
+or graph replay. See [retriever heads](docs/epilogues.md) for usage and custom operations.
+
 ```python
 import packed_encoders as pe
 from transformers import AutoModel
