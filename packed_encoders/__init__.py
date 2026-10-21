@@ -45,6 +45,10 @@ _LAZY = {
 
 
 def __getattr__(name: str):
+    if name == "epilogues":
+        import importlib
+
+        return importlib.import_module("packed_encoders.epilogues")
     if name in _LAZY:
         import importlib
 
@@ -74,6 +78,7 @@ _keep_public_functions()
 
 
 __all__ = [
+    "epilogues",
     "ModernBertCPU",
     "PaddedGraphConfig",
     "Qwen35Report",

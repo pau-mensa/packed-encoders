@@ -67,16 +67,35 @@ Training capture retains its exact-shape and persistent-gradient requirements.
 ## Packed input and pieces
 
 `PackedBatch` construction neither copies metadata nor reads device values.
-ModernBERT requires flat int64 token IDs, int32 device sequence boundaries, a host
+CUDA ModernBERT requires flat int64 token IDs, int32 device sequence boundaries, a host
 maximum sequence length and int64 device positions. The caller/collator must supply
 consistent contiguous nonempty sequences and HF-compatible positions within that
-maximum. Optional host lengths are not rebuilt or consumed by ModernBERT.
+maximum. Optional host lengths are not rebuilt or consumed by CUDA ModernBERT.
 The result has shape `[real_tokens, hidden]` in input token order, including the
 encoder's final norm. Task heads, pooling and embedding normalization remain outside
 the encoder. Output buffer lifetime follows the existing engine path; consume or
 clone graph outputs before another replay when retaining them.
 
-ModernBERT selects executable operation pieces: LayerNorm, residual-add plus
+CPU ModernBERT also accepts `host_lengths` instead of sequence boundaries and
+defaults omitted positions to zero-based indices per sequence.
+
+All built-in packed engines support `runtime.with_epilogue(head)`. Custom heads
+implement `prepare(ops) -> forward(hidden, batch)` and can use
+`ops.prepare_linear()` for prepared projections. The composed encoder is
+inference-only and returns owned outputs. CPU applies the head per internal chunk;
+CUDA applies it after the existing packed forward/graph replay. The original
+runtime keeps returning hidden states. Unpacking closes its composed encoders too.
+
+`runtime.epilogue` shares preparation lifecycle, linear input validation, output
+validation/ownership and cleanup. Backends implement projection dtype policy and
+math (`cpu.epilogue`, `runtime.cuda_epilogue`). Engines opt in with initialization
+and teardown hooks; CPU additionally supplies the chunk boundary hook. CUDA
+BF16 bias-free heads reuse each engine's selected linear piece; other supported
+heads use PyTorch/cuBLAS. Heads preserve token count and order and return floating
+tensors on the hidden-state device. CPU head precision is FP32; CUDA defaults to
+the head weight dtype (BF16, FP16 or FP32), casting activations as needed.
+
+CUDA ModernBERT selects executable operation pieces: LayerNorm, residual-add plus
 LayerNorm, dispatched and dense projections, BHSD RoPE, packed-QKV-to-BSHD RoPE,
 BHSD and BSHD attention, and GeGLU. `ModernBertPieces` is an immutable selection;
 `bind()` checks semantic compatibility and extracts the direct callable for each

@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from packed_encoders.arch.weights import validation_ids_below
+from packed_encoders.runtime.cuda_epilogue import CUDAEpilogueSupport
 from packed_encoders.engine import Capabilities, ModelBinding, ValidationResult
 from packed_encoders.errors import PackedEncodersError, ValidationError
 from packed_encoders.runtime.graphs import (
@@ -400,7 +401,7 @@ class EmbeddingGemma2:
             raise
 
 
-class PackedEmbeddingGemma2:
+class PackedEmbeddingGemma2(CUDAEpilogueSupport):
     capabilities = Capabilities(inference_capture=True, original_forward_fallback=True)
 
     def __init__(self, owner, binding, state, backend):
@@ -409,6 +410,7 @@ class PackedEmbeddingGemma2:
         self.composition = state.engine.composition
         self.pieces = self.composition.all()
         self._closed = False
+        self._init_epilogues()
 
     def _require_open(self):
         if self._closed:
@@ -464,6 +466,7 @@ class PackedEmbeddingGemma2:
     def close(self, *, rollback=False):
         if self._closed:
             return
+        self._close_epilogues()
         self.state.runner = None
         self.state.graph_enabled = False
         self.state.engine.release(rollback=rollback)

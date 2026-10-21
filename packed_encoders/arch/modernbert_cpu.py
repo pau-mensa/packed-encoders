@@ -19,6 +19,7 @@ from packed_encoders.cpu.memory import rehome
 from packed_encoders.engine import Capabilities, ModelBinding, ValidationResult
 from packed_encoders.errors import PackedEncodersError, UnsupportedTargetError, ValidationError
 from packed_encoders.locate import is_modernbert_encoder
+from packed_encoders.runtime.epilogue import EpilogueSupport
 from packed_encoders.state import ATTR
 
 # Pack-time gate for precision="int8" against the FP32 HF forward (see validate()).
@@ -147,7 +148,7 @@ class ModernBertCPU:
             packed.close()
 
 
-class PackedModernBertCPU:
+class PackedModernBertCPU(EpilogueSupport):
     capabilities = Capabilities(original_forward_fallback=True)
     pieces = ()
 
@@ -156,6 +157,8 @@ class PackedModernBertCPU:
         self.original_forward = binding.patch_target.forward
         self._lock = threading.RLock()
         self._closed = False
+        self._init_epilogues(lock=self._lock)
+        self.prepack_weights, self.tune_gemm = engine.prepack_weights, engine.tune_gemm
         self.max_tokens, self.requested_backend = engine.max_tokens, backend
         cfg = self.model.config
         self.hidden, self.heads = cfg.hidden_size, cfg.num_attention_heads
@@ -249,6 +252,8 @@ class PackedModernBertCPU:
     def _check(self):
         if self._closed:
             raise PackedEncodersError("this CPU engine has been closed; pack the model again")
+
+    _require_open = _check
 
     @property
     def graph_enabled(self):
@@ -359,7 +364,17 @@ class PackedModernBertCPU:
         if int(ids.min()) < 0 or int(ids.max()) >= self.model.embeddings.tok_embeddings.num_embeddings:
             raise PackedEncodersError("token IDs are outside the embedding vocabulary")
 
+    def _epilogue_context(self):
+        from packed_encoders.cpu.epilogue import CPUPreparation
+        return CPUPreparation(self)
+
+    def _forward_epilogue(self, batch, apply):
+        return self._forward_packed(batch, epilogue=apply)
+
     def forward_packed(self, batch: PackedBatch):
+        return self._forward_packed(batch)
+
+    def _forward_packed(self, batch: PackedBatch, epilogue=None):
         with self._lock:
             self._check()
             if self.model.training or torch.is_grad_enabled() or torch.is_autocast_enabled("cpu"):
@@ -381,24 +396,34 @@ class PackedModernBertCPU:
             positions = batch.position_ids
             if positions is None:
                 positions = torch.cat([torch.arange(n) for n in lengths])
-            return self._packed(batch.input_ids, tuple(lengths), positions)
+            return self._packed(batch.input_ids, tuple(lengths), positions, epilogue=epilogue)
 
-    def _packed(self, ids, lengths, positions):
+    def _packed(self, ids, lengths, positions, epilogue=None):
         if (positions.device.type != "cpu" or positions.dtype != torch.int64 or positions.shape != ids.shape
                 or int(positions.min()) < 0 or int(positions.max()) >= self.max_position):
             raise PackedEncodersError("CPU positions must be int64, match IDs, and lie within max_position_embeddings")
         if max(lengths) > self.max_tokens or max(lengths) > self.max_position:
             raise PackedEncodersError("sequence exceeds the engine's max_tokens or max_position_embeddings")
         core = self._core if self.int8 is None else self.int8.core
+
+        def run(chunk_ids, chunk_lengths, chunk_positions):
+            hidden = core(chunk_ids, chunk_lengths, chunk_positions)
+            if epilogue is None:
+                return hidden
+            cu = torch.tensor((0, *chunk_lengths), dtype=torch.int32).cumsum(0, dtype=torch.int32)
+            batch = PackedBatch(chunk_ids, cu_seqlens=cu, max_seqlen=max(chunk_lengths),
+                                position_ids=chunk_positions, host_lengths=chunk_lengths)
+            return epilogue(hidden, batch)
+
         outputs, offset, group = [], 0, []
         for length in lengths:
             if group and sum(group) + length > self.max_tokens:
                 count = sum(group)
-                outputs.append(core(ids[offset:offset+count], tuple(group), positions[offset:offset+count]))
+                outputs.append(run(ids[offset:offset+count], tuple(group), positions[offset:offset+count]))
                 offset += count
                 group = []
             group.append(length)
-        outputs.append(core(ids[offset:], tuple(group), positions[offset:]))
+        outputs.append(run(ids[offset:], tuple(group), positions[offset:]))
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
     def _core(self, ids, lengths, positions, linear=None):
@@ -470,6 +495,7 @@ class PackedModernBertCPU:
 
     def close(self, *, rollback=False):
         with self._lock:
+            self._close_epilogues()
             if self.int8 is not None:
                 self.int8.close()
                 self.int8 = None

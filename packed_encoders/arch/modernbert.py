@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from packed_encoders.runtime.cuda_epilogue import CUDAEpilogueSupport
 from packed_encoders.engine import Capabilities, ModelBinding, ValidationResult
 from packed_encoders.errors import PackedEncodersError
 from packed_encoders.locate import is_modernbert_encoder
@@ -82,7 +83,7 @@ class ModernBert:
         return ValidationResult(self.name, _validate_modernbert(binding.weight_source, pieces=self.pieces, **kwargs))
 
 
-class PackedModernBert:
+class PackedModernBert(CUDAEpilogueSupport):
     capabilities = Capabilities(training=True, inference_capture=True, training_capture=True)
     def __init__(self, binding: ModelBinding, state):
         self.binding = binding
@@ -90,6 +91,7 @@ class PackedModernBert:
         self.composition = state.pieces
         self.pieces = self.composition.all()
         self._closed = False
+        self._init_epilogues()
 
     def _require_open(self):
         if self._closed:
@@ -169,6 +171,7 @@ class PackedModernBert:
 
     def close(self, *, rollback: bool = False) -> None:
         # ModernBERT never replaces or prepares copies of parameter storage.
+        self._close_epilogues()
         self.state.graph_runner = None
         self.state.packed_graph_runner = None
         self.state.train_graph_runner = None

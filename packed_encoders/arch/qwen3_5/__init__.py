@@ -38,6 +38,7 @@ from packed_encoders.errors import PackedEncodersError, ValidationError
 from packed_encoders.runtime.graphs import PaddedGraphConfig, PaddedGraphRunner, graphs_globally_disabled
 from packed_encoders.runtime.staging import PinnedStager
 from packed_encoders.state import ATTR
+from packed_encoders.runtime.cuda_epilogue import CUDAEpilogueSupport
 from packed_encoders.engine import Capabilities, ModelBinding, ValidationResult
 
 MIN_CAPABILITY = (8, 0)   # bf16 tensor cores; fla's Triton kernels target sm_80+
@@ -566,7 +567,7 @@ class Qwen35Hybrid:
             raise
 
 
-class PackedQwen35:
+class PackedQwen35(CUDAEpilogueSupport):
     capabilities = Capabilities(inference_capture=True, original_forward_fallback=True)
 
     def __init__(self, owner, binding, state, backend):
@@ -575,6 +576,7 @@ class PackedQwen35:
         self.composition = state.engine.composition
         self.pieces = self.composition.all()
         self._closed = False
+        self._init_epilogues()
 
     def _require_open(self):
         if self._closed:
@@ -660,6 +662,7 @@ class PackedQwen35:
     def close(self, *, rollback=False):
         if self._closed:
             return
+        self._close_epilogues()
         self.state.runner = None
         self.state.shared_runner = None
         self.state.graph_enabled = False
