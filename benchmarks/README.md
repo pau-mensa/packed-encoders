@@ -26,6 +26,10 @@ native row and attention kernels, the native FP32 projection GEMM, AVX512-VNNI i
 and their measurements against ONNX Runtime FP32 and int8. The per-item notes and
 raw results live in the same directory.
 
+[`cpu_avx2/README.md`](cpu_avx2/README.md) measures the engine on an AVX2-only x86 CPU
+(i9-13900K) against stock HF and ONNX Runtime FP32, dynamic int8 and weight-only int8, with
+the scripts and raw JSON.
+
 ## Published showcases
 
 | Workload | Hardware | Protocol | Runner | Canonical config |
