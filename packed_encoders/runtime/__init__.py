@@ -5,6 +5,7 @@
                 and gathering the real tokens back out.
 - `attention` — pick a varlen attention kernel for one head geometry by probing each
                 candidate against fp32 SDPA, not by a lookup table.
+- `epilogue`  — compose inference heads with shared preparation, validation and lifetime.
 
 An engine supplies the math (`prepare_static` + `padded_core` for graphs, its own eager
 packed forward); nothing here knows which architecture it is running.

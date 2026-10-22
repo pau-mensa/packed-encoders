@@ -11,9 +11,11 @@ from torch import Tensor
 class PackedBatch:
     """Real token IDs in sequence order; output has the same order, [tokens, hidden].
 
-    Engines declare their required metadata. ModernBERT needs device cu_seqlens
+    Engines declare their required metadata. CUDA ModernBERT needs device cu_seqlens
     (int32), max_seqlen and device positions; host_lengths is optional. Qwen may
-    instead require host lengths. Construction never derives or validates tensor
+    instead require host lengths. CPU ModernBERT accepts host lengths or CPU
+    cu_seqlens, and defaults omitted positions to zero-based per-sequence indices.
+    Construction never derives or validates tensor
     values. Callers own consistency and must not mutate metadata during a call.
 
     Positions preserve the original model's semantics; they are not implicitly

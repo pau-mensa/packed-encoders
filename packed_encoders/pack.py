@@ -14,15 +14,9 @@ import torch
 from torch import Tensor, nn
 from transformers.modeling_outputs import BaseModelOutput
 
-from packed_encoders import ops
 from packed_encoders.engine import OMITTED
 from packed_encoders.config import ModernBertParams
 from packed_encoders.errors import PackedEncodersError
-from packed_encoders.forward import fused_forward
-from packed_encoders.graph import (
-    GraphConfig, build_packed_runner, build_runner, graphs_globally_disabled, rectangular_graph_backend,
-)
-from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
 from packed_encoders.state import ATTR, PatchState
 from packed_encoders.validate import _validate_modernbert as _validate
 
@@ -35,6 +29,7 @@ def pack(
     train_cuda_graph=OMITTED,
     cuda_graph_seq_cutoff=OMITTED,
     attention_backend=OMITTED,
+    precision=OMITTED,
     validate: bool = True,
 ) -> object:
     """Install the fused-tail forward onto `target` and return the same object.
@@ -75,6 +70,15 @@ def pack(
       A100, L40S, H200, and B200. Uncalibrated cards prefer Flash. SDPA is only the
       final no-kernel fallback.
 
+    `precision` (CPU ModernBERT engine only) selects the projection arithmetic:
+
+    - **`"fp32"` (default)** — exact FP32, validated against the HF forward.
+    - `"int8"` — int8 weights and activations on Apple CPUs with SME2 (M4 or later)
+      or Linux x86-64 CPUs with AVX512-VNNI: faster, approximate. Packing calibrates
+      on random tokens (no data needed). On other CPUs it warns and stays FP32
+      (`state.precision` reports which runs). Other
+      engines reject the option; changing it requires unpacking first.
+
     `validate` runs the hard gate during pack.
 
     Other architectures (see `packed_encoders.arch`) take the same call;
@@ -85,7 +89,7 @@ def pack(
     return _dispatch_pack(
         target, engine=engine, cuda_graph=cuda_graph, train_cuda_graph=train_cuda_graph,
         cuda_graph_seq_cutoff=cuda_graph_seq_cutoff, attention_backend=attention_backend,
-        validate=validate,
+        precision=precision, validate=validate,
     )
 
 
@@ -142,6 +146,7 @@ def _prepare_modernbert(
 
 def _default_backend() -> str:
     """Use auto if either optimized attention implementation imports."""
+    from packed_encoders import ops
     try:
         ops._load_flash_attn()
         return "auto"
@@ -157,6 +162,7 @@ def _resolve_attention_backend(backend: str) -> str:
     """Validate explicit dependencies and collapse auto only when neither exists."""
     if backend == "sdpa":
         return backend
+    from packed_encoders import ops
     flash_error = None
     triton_error = None
     try:
@@ -191,6 +197,7 @@ def _enable_graphs(
     cuda_graph: bool | GraphConfig,
     seq_cutoff: int | None = None,
 ) -> None:
+    from packed_encoders.graph import GraphConfig, build_runner, build_packed_runner, rectangular_graph_backend
     # Explicit config wins as-is; a bare `True` gets the default config with the
     # caller's seq cutoff applied.
     config = (
@@ -214,6 +221,7 @@ def _enable_train_graphs(
     train_cuda_graph: bool | TrainGraphConfig,
     seq_cutoff: int = 64,
 ) -> None:
+    from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
     # Explicit config wins as-is; a bare `True` gets the default config with the
     # caller's seq cutoff threaded into max_seq.
     config = (
@@ -247,6 +255,8 @@ def _unpack_modernbert(encoder: nn.Module) -> None:
 
 
 def _make_forward(encoder: nn.Module, state: PatchState):
+    from packed_encoders.forward import fused_forward
+    from packed_encoders.graph import graphs_globally_disabled
     def forward(
         input_ids: Tensor | None = None,
         attention_mask: Tensor | None = None,

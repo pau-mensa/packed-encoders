@@ -1,0 +1,39 @@
+{
+ "threads": 16,
+ "torch_threads": 16,
+ "rows": {
+  "b1_s16_pad32": {
+   "hf_ms": 32.01986604835838,
+   "hf_spread_pct": 22.3880045470517,
+   "engine_ms": 27.832922525703907,
+   "engine_spread_pct": 16.93882488935306,
+   "cos_min": 0.9999998807907104,
+   "speedup": 1.1504313288979193
+  },
+  "b1_s32": {
+   "hf_ms": 30.55718506220728,
+   "hf_spread_pct": 15.160182523885883,
+   "engine_ms": 31.937886495143175,
+   "engine_spread_pct": 15.727077323216374,
+   "cos_min": 0.9999998807907104,
+   "speedup": 0.9567691671411677
+  },
+  "b8_s32": {
+   "hf_ms": 97.21359645482153,
+   "hf_spread_pct": 6.870140890200097,
+   "engine_ms": 120.6451749894768,
+   "engine_spread_pct": 43.97230388705453,
+   "cos_min": 0.9999998211860657,
+   "speedup": 0.8057810555896738
+  }
+ },
+ "pack_s": 1.1155806710012257,
+ "engine": {
+  "backend": "native",
+  "native_linear": false,
+  "fused_rope": true,
+  "native_local": true,
+  "native_global": true,
+  "report": "CPUValidationReport(attention_backend='native', min_cosine=0.9999997615814209, relative_l2=5.293181402521441e-06, max_abs=8.535385131835938e-05, sequence_lengths=(7, 129), precision='fp32', median_cosine=1.0)"
+ }
+}

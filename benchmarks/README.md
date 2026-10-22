@@ -6,6 +6,30 @@ the lower-level attention benchmarks, and the remote launchers used to run them.
 Generated JSON results and downloaded datasets stay under the ignored
 `benchmarks/results/` and `benchmarks/data_cache/` directories.
 
+## Experimental CPU work
+
+The installable CPU engine is documented in
+[`../docs/modernbert-cpu.md`](../docs/modernbert-cpu.md). The notes below are the
+research behind it.
+
+[`docs/modernbert-cpu.md`](docs/modernbert-cpu.md) describes the initial M4 Pro
+ModernBERT layer probe, optimized ONNX Runtime baselines, and the experimental
+Accelerate local-attention kernel. These are synthetic FP32 CPU experiments,
+not full-model performance claims.
+
+[`docs/modernbert-cpu-full.md`](docs/modernbert-cpu-full.md) extends this to the
+pretrained 22-layer encoder, including ragged document/query batches, long single
+documents, full-output parity checks and memory-bounded ONNX baselines.
+
+[`cpu_x86/README.md`](cpu_x86/README.md) covers the x86 port (Ryzen 9 9950X, Zen 5):
+native row and attention kernels, the native FP32 projection GEMM, AVX512-VNNI int8,
+and their measurements against ONNX Runtime FP32 and int8. The per-item notes and
+raw results live in the same directory.
+
+[`cpu_avx2/README.md`](cpu_avx2/README.md) measures the engine on an AVX2-only x86 CPU
+(i9-13900K) against stock HF and ONNX Runtime FP32, dynamic int8 and weight-only int8, with
+the scripts and raw JSON.
+
 ## Published showcases
 
 | Workload | Hardware | Protocol | Runner | Canonical config |

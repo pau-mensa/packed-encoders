@@ -1,0 +1,83 @@
+{
+ "threads": 1,
+ "torch_threads": 1,
+ "rows": {
+  "b1_s16_pad32": {
+   "hf_ms": 91.04515903163701,
+   "hf_spread_pct": 7.166991759726315,
+   "engine_ms": 62.9277330590412,
+   "engine_spread_pct": 7.759718688862584,
+   "profile_ms": {
+    "projections": 57.798127682569124,
+    "rope_layout": 0.542746235926946,
+    "attn_global": 0.6018827746932706,
+    "add_norm": 0.5781835255523523,
+    "geglu": 0.40914843945453566,
+    "attn_local": 1.1705451179295778,
+    "core_total": 61.579075816553086
+   },
+   "cos_min": 0.9999998807907104,
+   "speedup": 1.44682089447295
+  },
+  "b1_s32": {
+   "hf_ms": 87.88569597527385,
+   "hf_spread_pct": 4.414757120366198,
+   "engine_ms": 93.19128398783505,
+   "engine_spread_pct": 3.8349585570287443,
+   "profile_ms": {
+    "projections": 80.54574433481321,
+    "rope_layout": 0.7513358723372221,
+    "attn_global": 3.53863398777321,
+    "add_norm": 0.7523559227896234,
+    "geglu": 0.6713520851917565,
+    "attn_local": 6.148521982443829,
+    "core_total": 92.91995951207355
+   },
+   "cos_min": 0.9999998807907104,
+   "speedup": 0.9430677657230929
+  },
+  "b8_s32": {
+   "hf_ms": 416.0159199964255,
+   "hf_spread_pct": 1.4868419025824715,
+   "engine_ms": 465.94613895285875,
+   "engine_spread_pct": 3.0827382450864604,
+   "profile_ms": {
+    "projections": 378.0082964415972,
+    "rope_layout": 4.040868623026957,
+    "attn_global": 26.96583278399582,
+    "add_norm": 4.174917936325073,
+    "geglu": 3.8943555555306375,
+    "attn_local": 46.71099304687232,
+    "core_total": 464.73607112420723
+   },
+   "cos_min": 0.9999997019767761,
+   "speedup": 0.8928412218016365
+  },
+  "b1_s1024": {
+   "hf_ms": 2213.584510027431,
+   "hf_spread_pct": 0.9794927077500893,
+   "engine_ms": 2308.146203053184,
+   "engine_spread_pct": 0.4518126295716888,
+   "profile_ms": {
+    "projections": 1456.0577587690204,
+    "rope_layout": 22.7437792539907,
+    "attn_global": 208.88161655360213,
+    "add_norm": 27.756068273447454,
+    "geglu": 16.728833492379636,
+    "attn_local": 573.1997581315227,
+    "core_total": 2310.0864506753474
+   },
+   "cos_min": 0.9999996423721313,
+   "speedup": 0.9590313244019517
+  }
+ },
+ "pack_s": 1.5462106899358332,
+ "engine": {
+  "backend": "native",
+  "native_linear": false,
+  "fused_rope": true,
+  "native_local": true,
+  "native_global": true,
+  "report": "CPUValidationReport(attention_backend='native', min_cosine=0.9999997615814209, relative_l2=2.691399231480318e-06, max_abs=4.8160552978515625e-05, sequence_lengths=(7, 129), precision='fp32', median_cosine=1.0)"
+ }
+}

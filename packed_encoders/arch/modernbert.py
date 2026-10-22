@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from packed_encoders.runtime.cuda_epilogue import CUDAEpilogueSupport
 from packed_encoders.engine import Capabilities, ModelBinding, ValidationResult
 from packed_encoders.errors import PackedEncodersError
 from packed_encoders.locate import is_modernbert_encoder
@@ -35,6 +36,10 @@ class ModernBertAdapter:
         return None
 
     def install(self, binding: ModelBinding, packed: PackedModernBert) -> None:
+        from packed_encoders.arch.modernbert_cpu import PackedModernBertCPU
+        if isinstance(packed, PackedModernBertCPU):
+            packed.install_forward()
+            return
         from packed_encoders.pack import _make_forward
         from packed_encoders.state import ATTR
 
@@ -46,10 +51,21 @@ class ModernBert:
     name = "modernbert"
     adapters = (ModernBertAdapter(),)
 
-    def __init__(self, *, pieces: ModernBertPieces | None = None):
+    def __init__(self, *, pieces: ModernBertPieces | None = None, device="auto"):
+        if device not in ("auto", "cpu", "cuda"):
+            raise ValueError("device must be 'auto', 'cpu' or 'cuda'")
         self.pieces = pieces
+        self.device = device
+
+    def _cpu(self, binding):
+        return self.device == "cpu" or (self.device == "auto" and next(binding.weight_source.parameters()).device.type == "cpu")
 
     def prepare(self, binding: ModelBinding, options: Mapping[str, Any]):
+        if self._cpu(binding):
+            if self.pieces is not None:
+                raise PackedEncodersError("CUDA operation pieces cannot be used by the CPU engine")
+            from packed_encoders.arch.modernbert_cpu import ModernBertCPU
+            return ModernBertCPU().prepare(binding, options)
         from packed_encoders.pack import _prepare_modernbert
 
         _check_options(options)
@@ -57,12 +73,17 @@ class ModernBert:
         return PackedModernBert(binding, state)
 
     def validate(self, binding: ModelBinding, **kwargs: Any) -> ValidationResult:
+        if self._cpu(binding):
+            if self.pieces is not None:
+                raise PackedEncodersError("CUDA operation pieces cannot be used by the CPU engine")
+            from packed_encoders.arch.modernbert_cpu import ModernBertCPU
+            return ModernBertCPU().validate(binding, **kwargs)
         from packed_encoders.validate import _validate_modernbert
 
         return ValidationResult(self.name, _validate_modernbert(binding.weight_source, pieces=self.pieces, **kwargs))
 
 
-class PackedModernBert:
+class PackedModernBert(CUDAEpilogueSupport):
     capabilities = Capabilities(training=True, inference_capture=True, training_capture=True)
     def __init__(self, binding: ModelBinding, state):
         self.binding = binding
@@ -70,6 +91,7 @@ class PackedModernBert:
         self.composition = state.pieces
         self.pieces = self.composition.all()
         self._closed = False
+        self._init_epilogues()
 
     def _require_open(self):
         if self._closed:
@@ -149,6 +171,7 @@ class PackedModernBert:
 
     def close(self, *, rollback: bool = False) -> None:
         # ModernBERT never replaces or prepares copies of parameter storage.
+        self._close_epilogues()
         self.state.graph_runner = None
         self.state.packed_graph_runner = None
         self.state.train_graph_runner = None

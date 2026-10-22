@@ -2,7 +2,8 @@
 
 Built from a HF config once at `pack()` time, decoupling the forward from HF's
 schema churn — notably the transformers 5.x move of the RoPE thetas under
-`rope_parameters[{full,sliding}_attention]`, which `from_hf_config` absorbs.
+`rope_parameters[{full,sliding}_attention]` and of the layer schedule into
+`layer_types`, which `from_hf_config` absorbs.
 """
 
 from __future__ import annotations
@@ -63,8 +64,25 @@ class ModernBertParams:
             global_rope_theta=global_theta,
             local_rope_theta=local_theta,
             local_attention=config.local_attention,
-            global_attn_every_n_layers=config.global_attn_every_n_layers,
+            global_attn_every_n_layers=_global_attn_every_n_layers(config),
         )
+
+
+def _global_attn_every_n_layers(config) -> int:
+    """The global-attention period across both ModernBERT config schemas. Transformers 5
+    runs the layers from `layer_types` and neither stores nor saves
+    `global_attn_every_n_layers` unless it was passed explicitly."""
+    kinds = getattr(config, "layer_types", None)
+    if not kinds:
+        return config.global_attn_every_n_layers
+    if set(kinds) <= {"full_attention", "sliding_attention"}:
+        for every in range(1, len(kinds) + 1):
+            if all((kind == "full_attention") == (i % every == 0) for i, kind in enumerate(kinds)):
+                return every
+    raise ValueError(
+        "packed-encoders needs global attention every n layers, starting at layer 0; "
+        f"got layer_types={list(kinds)}"
+    )
 
 
 def _rope_thetas(config) -> tuple[float, float]:

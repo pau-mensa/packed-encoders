@@ -6,6 +6,12 @@ inherits the speedup with no adapter. Curated engines (`packed_encoders.arch`):
 
 - ModernBERT / Ettin / mmBERT: CuteDSL LayerNorm, RoPE and GeGLU, cuBLAS GEMMs, packed
   attention with per-GPU dispatch; CUDA graphs optional (off by default).
+- CPU ModernBERT: FP32 packed inference with native attention and row kernels on
+  Apple Silicon (Accelerate, plus a prepared SME2 FP32 GEMM; with it, the native kernels run
+  on an engine-owned worker pool) and Linux x86-64 (GCC, plus a native FP32 GEMM on AVX-512), else tiled CPU SDPA;
+  opt-in int8 projections on Apple SME2 or x86
+  AVX512-VNNI (`precision="int8"`); original-forward fallback for training and
+  extra HF outputs.
 - Qwen3.5 / topk-embed-v1: hybrid FLA/Triton pieces, graphs on by default,
   original-forward fallback for gradients and image inputs.
 
@@ -27,8 +33,9 @@ from packed_encoders.errors import (
     ValidationError,
 )
 
-# Architecture-specific public names, loaded on first access (ModernBERT's import CuteDSL).
+# Architecture-specific public names, loaded on first access.
 _LAZY = {
+    "ModernBertCPU": ("packed_encoders.arch.modernbert_cpu", "ModernBertCPU"),
     "PaddedGraphConfig": ("packed_encoders.runtime.graphs", "PaddedGraphConfig"),
     "Qwen35Report": ("packed_encoders.arch.qwen3_5", "Qwen35Report"),
     "GraphConfig": ("packed_encoders.graph", "GraphConfig"),
@@ -38,6 +45,10 @@ _LAZY = {
 
 
 def __getattr__(name: str):
+    if name == "epilogues":
+        import importlib
+
+        return importlib.import_module("packed_encoders.epilogues")
     if name in _LAZY:
         import importlib
 
@@ -67,6 +78,8 @@ _keep_public_functions()
 
 
 __all__ = [
+    "epilogues",
+    "ModernBertCPU",
     "PaddedGraphConfig",
     "Qwen35Report",
     "PackedBatch",

@@ -18,6 +18,7 @@ def pack(
     train_cuda_graph: Any = OMITTED,
     cuda_graph_seq_cutoff: Any = OMITTED,
     attention_backend: Any = OMITTED,
+    precision: Any = OMITTED,
     validate: bool = True,
 ) -> object:
     """Prepare and install an engine in place; return the original target.
@@ -28,7 +29,7 @@ def pack(
     options = {k: v for k, v in (
         ("cuda_graph", cuda_graph), ("train_cuda_graph", train_cuda_graph),
         ("cuda_graph_seq_cutoff", cuda_graph_seq_cutoff),
-        ("attention_backend", attention_backend),
+        ("attention_backend", attention_backend), ("precision", precision),
     ) if v is not OMITTED}
     installed = find_installation(target)
     if installed is not None:

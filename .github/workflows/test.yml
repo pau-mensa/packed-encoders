@@ -42,7 +42,7 @@ jobs:
         env:
           PROFILE: ${{ matrix.profile }}
         run: |
-          target="."
+          target=".[cuda]"
           if [[ "$PROFILE" != "base" ]]; then
             target=".[$PROFILE]"
           fi
@@ -52,6 +52,21 @@ jobs:
 
       - name: Run tests
         run: pytest tests/
+
+  cpu-runtime:
+    name: CPU runtime / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          activate-environment: true
+      - run: uv pip install --no-sources --torch-backend cpu -e . pytest
+      - run: python -c 'import signal, pytest; signal.alarm(60); raise SystemExit(pytest.main(["-q", "tests/test_modernbert_cpu.py", "tests/test_cpu_sme.py", "tests/test_cpu_epilogues.py", "tests/test_epilogues.py", "tests/test_registry.py"]))'
 
   lock:
     name: Installation lock and wheel
