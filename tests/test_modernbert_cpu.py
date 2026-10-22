@@ -146,6 +146,66 @@ def test_mask_paths(model, monkeypatch):
     assert len(delegated) == 4
 
 
+@torch.no_grad()
+def test_hf_inputs_take_the_packed_path(model, monkeypatch):
+    # Float masks and int32 IDs, which HF accepts, stay on the engine and match HF.
+    ids, mask = inputs()
+    pe.pack(model)
+    engine = pe.get_engine(model)
+    delegated = []
+    hf = engine.original_forward
+    monkeypatch.setattr(engine, "original_forward", lambda *a, **k: delegated.append(1) or hf(*a, **k))
+    for call_ids, call_mask in ((ids, mask.float()), (ids.int(), mask), (ids.int(), mask.flip(1).float())):
+        real = call_mask.bool()
+        expected = hf(call_ids.long(), attention_mask=real).last_hidden_state[real]
+        out = model(call_ids, attention_mask=call_mask).last_hidden_state
+        torch.testing.assert_close(out[real], expected, atol=2e-5, rtol=2e-5)
+    assert not delegated
+
+
+@pytest.mark.parametrize("task", ["sequence_classification", "masked_lm", "token_classification"])
+@torch.no_grad()
+def test_hf_task_heads_take_the_packed_path(model, monkeypatch, task):
+    # HF heads call the backbone with position_ids=None and inputs_embeds=None.
+    import transformers
+    cls = {"sequence_classification": transformers.ModernBertForSequenceClassification,
+           "masked_lm": transformers.ModernBertForMaskedLM,
+           "token_classification": transformers.ModernBertForTokenClassification}[task]
+    with torch.random.fork_rng():
+        torch.manual_seed(42)
+        head = cls(model.config).eval()
+    ids, mask = inputs()
+    ref = head(ids, attention_mask=mask).logits
+    pe.pack(head)
+    try:
+        engine = pe.get_engine(head)
+        delegated = []
+        hf = engine.original_forward
+        monkeypatch.setattr(engine, "original_forward", lambda *a, **k: delegated.append(1) or hf(*a, **k))
+        out = head(ids, attention_mask=mask).logits
+        assert not delegated
+        if task != "sequence_classification":
+            out, ref = out[mask], ref[mask]  # padded positions hold zeros, not HF's values
+        torch.testing.assert_close(out, ref, atol=2e-5, rtol=2e-5)
+    finally:
+        pe.unpack(head)
+
+
+def test_validate_options(model):
+    # pe.validate's ModernBERT options; validating without packing leaves the weights in place.
+    storage = [p.data_ptr() for p in model.parameters()]
+    report = pe.validate(model, engine=pe.ModernBertCPU(rehome_weights=True), seq_lens=(5, 40))
+    assert report.sequence_lengths[:2] == (5, 40) and report.min_cosine > .99999
+    assert storage == [p.data_ptr() for p in model.parameters()]
+    pe.pack(model)
+    assert pe.validate(model, seq_lens=(3, 9, 256), cos_threshold=.999).sequence_lengths[:3] == (3, 9, 256)
+    for lengths in ((), (0,), (257,), (4.0,)):
+        with pytest.raises(PackedEncodersError, match="seq_lens"):
+            pe.validate(model, seq_lens=lengths)
+    with pytest.raises(ValidationError):
+        pe.validate(model, cos_threshold=1.01)
+
+
 @pytest.mark.parametrize("change", ["parameter", "storage", "dtype", "submodule", "forward_hook", "pre_hook",
                                     "config"])
 @torch.no_grad()

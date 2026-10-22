@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import copy
 from dataclasses import dataclass
 import threading
 from types import SimpleNamespace
@@ -141,7 +142,10 @@ class ModernBertCPU:
             raise
 
     def validate(self, binding, **kwargs):
-        packed = self.prepare(binding, {"validate": False})
+        # Validating without packing leaves the model's weight storage where it is.
+        engine = copy.copy(self)
+        engine.rehome_weights = False
+        packed = engine.prepare(binding, {"validate": False})
         try:
             return packed.validate(**kwargs)
         finally:
@@ -287,7 +291,9 @@ class PackedModernBertCPU(EpilogueSupport):
         with self._lock:
             self._check()
             cfg = self.model.config
-            unsupported = set(kwargs) - {"return_dict", "output_hidden_states", "output_attentions", "token_type_ids"}
+            # HF task heads pass position_ids=None and inputs_embeds=None; only set values change the forward.
+            unsupported = {key for key, value in kwargs.items() if value is not None} - {
+                "return_dict", "output_hidden_states", "output_attentions", "token_type_ids"}
             extra_outputs = any(kwargs.get(key) if kwargs.get(key) is not None else getattr(cfg, key, False)
                                 for key in ("output_hidden_states", "output_attentions"))
             token_types = kwargs.get("token_type_ids")
@@ -296,6 +302,8 @@ class PackedModernBertCPU(EpilogueSupport):
                         or (token_types is not None and bool(token_types.any())))
             if fallback:
                 return self.original_forward(input_ids, attention_mask, *args, **kwargs)
+            if input_ids.dtype == torch.int32:  # HF's embedding accepts int32 IDs too
+                input_ids = input_ids.long()
             self._ids(input_ids, ndim=2)
             out = self._prefixes(input_ids, attention_mask) if self.fast_masks else None
             if out is None:
@@ -319,7 +327,7 @@ class PackedModernBertCPU(EpilogueSupport):
         if attention_mask is not None:
             if attention_mask.device.type != "cpu" or attention_mask.shape != input_ids.shape:
                 return None
-            counts = attention_mask.sum(1)
+            counts = (attention_mask != 0).sum(1)  # integer lengths for float masks too
             prefix = columns < counts[:, None]
             if not bool((attention_mask == prefix).all()):
                 return None
@@ -446,18 +454,29 @@ class PackedModernBertCPU(EpilogueSupport):
             x, normed = cpu.add_norm(x, linear(cpu.geglu(linear(normed, wi, bi)), wmo, bmo), after, owned=final)
         return normed[0]
 
-    def validate(self):
+    def validate(self, *, seq_lens=None, cos_threshold=None):
+        """Compare with the HF forward. ``seq_lens`` replaces the default ragged batch (7 and
+        129 tokens) with one batch of those lengths; ``cos_threshold`` replaces the cosine
+        bound, which applies to every token in FP32 (0.99999) and to the median in int8."""
         with self._lock:
             self._check()
             states = [(module, module.training) for module in self.model.modules()]
-            lengths = (min(7, self.max_position, self.max_tokens), min(129, self.max_position, self.max_tokens))
+            limit = min(self.max_position, self.max_tokens)
+            if seq_lens is None:
+                lengths = (min(7, limit), min(129, limit))
+            else:
+                lengths = tuple(seq_lens)
+                if not lengths or any(type(n) is not int or not 0 < n <= limit for n in lengths):
+                    raise PackedEncodersError(f"seq_lens must be positive integers of at most {limit} tokens")
+            if cos_threshold is None:
+                cos_threshold = 0.99999 if self.precision == "fp32" else INT8_MEDIAN_COSINE
             cases = [lengths]
             if self.attention.sme is not None and self.attention.sme.weights:
                 # One ragged call may exceed SME's dispatch limit. Exercise its register tiles,
                 # row-block loop, and (within that limit) the 512-row tile groups.
                 cases.extend((min(n, self.max_position, self.max_tokens),)
                              for n in (16, 32, min(self.attention.sme.max_rows, 545)))
-            ids = torch.randint(self.model.config.vocab_size, (2, max(map(max, cases))),
+            ids = torch.randint(self.model.config.vocab_size, (max(map(len, cases)), max(map(max, cases))),
                                 generator=torch.Generator().manual_seed(17))
             reports = []
             try:
@@ -477,9 +496,9 @@ class PackedModernBertCPU(EpilogueSupport):
                                                      float(cosine.median()))
                         # int8 bounds typical-token cosine and overall error; FP32 bounds every token.
                         if self.precision == "fp32":
-                            failed = report.min_cosine < 0.99999 or report.relative_l2 > 2e-4
+                            failed = report.min_cosine < cos_threshold or report.relative_l2 > 2e-4
                         else:
-                            failed = report.median_cosine < INT8_MEDIAN_COSINE or report.relative_l2 > INT8_RELATIVE_L2
+                            failed = report.median_cosine < cos_threshold or report.relative_l2 > INT8_RELATIVE_L2
                         if not torch.isfinite(actual).all() or failed:
                             raise ValidationError(f"CPU ModernBERT output validation failed: {report}")
                         reports.append(report)
