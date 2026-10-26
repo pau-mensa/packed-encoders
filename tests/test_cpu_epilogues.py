@@ -262,3 +262,56 @@ def test_fp32_head_on_int8_backbone(model):
     encoder = runtime.with_epilogue(pe.epilogues.TokenProjection(projection))
     reference = F.normalize(projection(runtime.forward_packed(batch())), dim=-1)
     torch.testing.assert_close(encoder.forward_packed(batch()), reference, atol=2e-5, rtol=2e-5)
+
+
+@torch.no_grad()
+def test_head_tuning_does_not_replace_backbone_tiles(model, monkeypatch):
+    from packed_encoders.cpu import attention
+
+    def tune(linear, projections, threads, l1_bytes, max_tokens):
+        weight, _ = next(iter(projections))
+        key = (16, *weight.shape)
+        return {key: (2, 4)}, {key: {"selected": (2, 4)}}
+
+    pe.pack(model, attention_backend="auto")
+    runtime = pe.get_engine(model)
+    cpu = runtime.attention
+    if not cpu.native_linear:
+        pytest.skip("native AVX-512 GEMM required")
+    key = (16, 128, 128)
+    cpu.linear_tiles[key] = (3, 8)
+    cpu.linear_tuning[key] = {"selected": (3, 8)}
+    runtime.tune_gemm = True
+    monkeypatch.setattr(attention, "tune_tiles", tune)
+    encoder = runtime.with_epilogue(pe.epilogues.TokenProjection(nn.Linear(128, 128)))
+    operation = encoder._context._operations[0]
+    assert operation._tiles[key] == (2, 4)
+    assert cpu.linear_tiles[key] == (3, 8)
+    assert cpu.linear_tuning[key]["selected"] == (3, 8)
+    x = torch.randn(16, 128)
+    saved = operation(x)
+    expected = saved.clone()
+    assert saved.data_ptr() not in {t.data_ptr() for t in cpu.linear_buffers.values()}
+    operation(x + 1)
+    torch.testing.assert_close(saved, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@torch.no_grad()
+def test_builtin_head_returns_its_owned_output_without_another_copy(model, monkeypatch, normalize):
+    pe.pack(model, attention_backend="sdpa")
+    encoder = pe.get_engine(model).with_epilogue(
+        pe.epilogues.TokenProjection(nn.Linear(128, 64), normalize=normalize))
+    hidden = torch.randn(18, 128)
+    produced = []
+    forward = encoder._forward
+
+    def record(*args):
+        output = forward(*args)
+        produced.append(output)
+        return output
+
+    record._packed_encoders_owned_output = forward._packed_encoders_owned_output
+    encoder._forward = record
+    monkeypatch.setattr(encoder._runtime, "_forward_epilogue", lambda inputs, apply: apply(hidden, inputs))
+    assert encoder.forward_packed(batch()) is produced[0]

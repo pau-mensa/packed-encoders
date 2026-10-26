@@ -24,6 +24,7 @@ class _CPULinear(PreparedLinear):
     def __init__(self, context, weight, bias):
         super().__init__(context, weight, bias)
         self._sme = None
+        self._tiles = {}
         runtime = context._runtime
         cpu = runtime.attention
         try:
@@ -36,18 +37,22 @@ class _CPULinear(PreparedLinear):
                     except PackedEncodersError as exc:
                         warnings.warn(str(exc), stacklevel=3)
             if runtime.tune_gemm:
-                cpu.tune_linear([(weight, bias)], runtime.max_tokens)
+                self._tiles = cpu.tune_linear([(weight, bias)], runtime.max_tokens, shared=False)
         except BaseException:
             self._close()
             raise
 
-    def _execute(self, x):
+    def _execute_owned(self, x):
         cpu = self._context._runtime.attention
         out = None if self._sme is None else self._sme.linear(x, self._weight, self._bias, cpu.threads)
-        return cpu.linear(x, self._weight, self._bias) if out is None else out
+        # F.linear already owns its result; native GEMM writes directly into an
+        # owned tensor. Only SME's reusable output still needs a copy here.
+        return (cpu.linear(x, self._weight, self._bias, tiles=self._tiles, owned=True)
+                if out is None else out.clone())
 
     def _close(self):
         if self._sme is not None:
             self._sme.close()
             self._sme = None
+        self._tiles.clear()
         super()._close()

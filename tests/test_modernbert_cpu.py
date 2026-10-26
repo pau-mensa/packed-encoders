@@ -46,6 +46,17 @@ def inputs():
     return ids, mask
 
 
+@pytest.mark.parametrize('workers,expected', [(None, 1), (2, 2)])
+def test_default_worker_budget_reaches_engine_without_resizing_torch(model, monkeypatch, workers, expected):
+    from packed_encoders.cpu import topology
+
+    monkeypatch.setattr(topology, 'default_threads', lambda: 1)
+    before = torch.get_num_threads()
+    pe.pack(model, engine=pe.ModernBertCPU(threads=workers))
+    assert pe.get_engine(model).attention.threads == expected
+    assert torch.get_num_threads() == before
+
+
 @pytest.mark.parametrize("backend", ["sdpa", "auto", "native"])
 @torch.no_grad()
 def test_parity_and_owned_outputs(model, backend):
@@ -411,8 +422,10 @@ def test_native_linear():
 
 
 @native_linear
+@pytest.mark.parametrize("backend", ["native", "auto"])
 @torch.no_grad()
-def test_avx2_build_keeps_native_rows_and_attention(model, monkeypatch):
+def test_avx2_build_keeps_native_rows_and_attention(model, monkeypatch, backend):
+    monkeypatch.setenv('PACKED_ENCODERS_CPU_CACHE_DIR', '')
     import packed_encoders.cpu.attention as cpu
 
     # Compile and execute the AVX2 target on this AVX-512 host. The optional GEMM
@@ -427,11 +440,12 @@ def test_avx2_build_keeps_native_rows_and_attention(model, monkeypatch):
     library, directory = cpu._x86_library.__wrapped__()
     monkeypatch.setattr(cpu, "_x86_library", lambda: (library, directory))
     assert not hasattr(library, "pe_linear")
-    pe.pack(model, attention_backend="native")  # also validates full-model FP32 parity
+    pe.pack(model, attention_backend=backend)  # also validates full-model FP32 parity
     attention = pe.get_engine(model).attention
     assert attention.rows is library and attention.library is library
     assert attention.fused_rope and attention.fused_geglu and attention.fused_norm
     assert not attention.native_linear
+    assert bool(attention.attention_tuning) == (backend == "auto")
     # The short attention specializations also work when v16 uses two AVX2 halves.
     rng = torch.Generator().manual_seed(43)
     lengths = (16, 32)
@@ -760,6 +774,22 @@ def test_int8_prepared_attention_reuses_current_buffers(model, monkeypatch, thre
     att.token_major = False
     actual = engine.forward_packed(batch)
     assert torch.equal(actual, expected)
+
+
+@int8_kernels
+@torch.no_grad()
+def test_int8_attention_respects_tuned_sdpa_and_mixed_choices(model):
+    scale_projections(model)
+    pe.pack(model, engine=pe.ModernBertCPU(threads=1), precision="int8", attention_backend="native")
+    engine = pe.get_engine(model)
+    att = engine.attention
+    ids = torch.arange(32) % 61 + 3
+    batch = pe.PackedBatch(ids, host_lengths=(32,))
+    expected = engine.forward_packed(batch).clone()
+    for local, global_ in (("sdpa", "sdpa"), ("native", "sdpa"), ("sdpa", "native")):
+        att.attention_tuning = {(True, 32, 1): {"selected": local},
+                                (False, 32, 1): {"selected": global_}}
+        torch.testing.assert_close(engine.forward_packed(batch), expected, atol=2e-5, rtol=2e-5)
 
 
 @int8_kernels

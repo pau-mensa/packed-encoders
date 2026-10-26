@@ -1,0 +1,213 @@
+{
+  "args": {
+    "system": "engine",
+    "threads": 16,
+    "native_threads": "same",
+    "precision": "fp32",
+    "backend": "auto",
+    "model": null,
+    "spin": 1,
+    "only": "b32_s8192,b32_rand_pad8192",
+    "trials": 1,
+    "warmup": 0,
+    "ort_row_warmup": true,
+    "reference_cache": ".cache/cpu-review-oracles",
+    "out": "benchmarks/cpu_review/results/engine_fp32_t16_8192.json"
+  },
+  "date": "2026-10-25",
+  "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+  "platform": "Linux-7.2.7-arch1-1-x86_64-with-glibc2.44",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "torch_threads": 16,
+  "omp_wait_policy": null,
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "transformers": "5.3.0",
+    "onnxruntime": "1.31.0"
+  },
+  "rows": {
+    "b32_s8192": {
+      "median_ms": 103123.97762299997,
+      "samples_ms": [
+        103123.97762299997
+      ],
+      "lengths": [
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192,
+        8192
+      ],
+      "live_tokens": 262144,
+      "relL2": 9.35233310883632e-06,
+      "cos_min": 0.9999992251396179,
+      "cos_median": 1.0
+    },
+    "b32_rand_pad8192": {
+      "median_ms": 37810.44889799978,
+      "samples_ms": [
+        37810.44889799978
+      ],
+      "lengths": [
+        1140,
+        4336,
+        3113,
+        7012,
+        2915,
+        2189,
+        4200,
+        2346,
+        1029,
+        712,
+        4420,
+        1154,
+        5365,
+        5414,
+        7595,
+        633,
+        6331,
+        7740,
+        1115,
+        4062,
+        6425,
+        2069,
+        3653,
+        3559,
+        1714,
+        4938,
+        2240,
+        617,
+        5438,
+        2507,
+        4082,
+        2043
+      ],
+      "live_tokens": 112106,
+      "relL2": 9.075470188690815e-06,
+      "cos_min": 0.9999993443489075,
+      "cos_median": 1.0
+    }
+  },
+  "reference_keys": {
+    "b32_s8192": "b0c5e1240d4bbf0f68e24aab6a8409db1d8663d4356a1e6d7a2785037e4d4bef",
+    "b32_rand_pad8192": "2219dda46695aefddd7bd1282f13a5c144d201badc79dca875281b54d147f753"
+  },
+  "pack_s": 0.42791245899979913,
+  "native_threads": 16,
+  "attention_tuning": {
+    "(False, 32, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.014443666666666667,
+        "sdpa": 0.03739033333333333
+      }
+    },
+    "(True, 32, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.007957,
+        "sdpa": 0.027656666666666666
+      }
+    },
+    "(False, 32, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.02437,
+        "sdpa": 0.19752866666666666
+      }
+    },
+    "(True, 32, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.019390333333333332,
+        "sdpa": 0.25460266666666664
+      }
+    },
+    "(False, 128, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.03506366666666667,
+        "sdpa": 0.07593733333333333
+      }
+    },
+    "(True, 128, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.032237,
+        "sdpa": 0.14508833333333335
+      }
+    },
+    "(False, 128, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.22114866666666666,
+        "sdpa": 0.6155693333333333
+      }
+    },
+    "(True, 128, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.183995,
+        "sdpa": 1.1241206666666668
+      }
+    },
+    "(True, 512, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.155288,
+        "sdpa": 0.6754296666666667
+      }
+    },
+    "(True, 512, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.9426356666666666,
+        "sdpa": 5.555150666666667
+      }
+    }
+  }
+}

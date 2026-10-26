@@ -1,0 +1,136 @@
+{
+  "args": {
+    "system": "engine",
+    "threads": 16,
+    "precision": "fp32",
+    "backend": "auto",
+    "model": null,
+    "spin": 1,
+    "only": "b32_s1024,b32_rand_pad1024",
+    "trials": 3,
+    "out": "benchmarks/cpu_review/results/engine_fp32_t16_long.json"
+  },
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "transformers": "5.3.0",
+    "onnxruntime": "1.31.0"
+  },
+  "platform": "Linux-7.2.7-arch1-1-x86_64-with-glibc2.44",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "rows": {
+    "b32_rand_pad1024": {
+      "median_ms": 3746.35545000001,
+      "samples_ms": [
+        3691.038628000001,
+        3759.9868880000713,
+        3746.35545000001
+      ],
+      "live_tokens": 17837,
+      "relL2": 6.5417320911365096e-06,
+      "cos_min": 0.9999993443489075,
+      "cos_median": 1.0
+    },
+    "b32_s1024": {
+      "median_ms": 7431.289321999998,
+      "samples_ms": [
+        7431.0046759999295,
+        7865.584191000039,
+        7431.289321999998
+      ],
+      "live_tokens": 32768,
+      "relL2": 6.4258542806783225e-06,
+      "cos_min": 0.9999994039535522,
+      "cos_median": 1.0
+    }
+  },
+  "pack_s": 1.8004349200000433,
+  "attention_tuning": {
+    "(False, 32, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.008673333333333333,
+        "sdpa": 0.02223
+      }
+    },
+    "(True, 32, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.00792,
+        "sdpa": 0.029506666666666667
+      }
+    },
+    "(False, 32, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.021957,
+        "sdpa": 0.18253466666666668
+      }
+    },
+    "(True, 32, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.020176666666666666,
+        "sdpa": 0.26393833333333333
+      }
+    },
+    "(False, 128, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.04315366666666667,
+        "sdpa": 0.085094
+      }
+    },
+    "(True, 128, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.032093666666666666,
+        "sdpa": 0.14964766666666668
+      }
+    },
+    "(False, 128, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.221768,
+        "sdpa": 0.6121243333333334
+      }
+    },
+    "(True, 128, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.18619466666666667,
+        "sdpa": 1.0976873333333332
+      }
+    },
+    "(True, 512, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.13813433333333333,
+        "sdpa": 0.6557843333333333
+      }
+    },
+    "(True, 512, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.9821536666666667,
+        "sdpa": 6.394567666666667
+      }
+    }
+  }
+}

@@ -223,6 +223,7 @@ __marimo__/
 flash-maxsim/
 
 # benchmark artifacts
+hardware-results/
 benchmarks/results/
 benchmarks/data_cache/
 showcase/results/

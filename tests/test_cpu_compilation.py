@@ -6,16 +6,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from packed_encoders.cpu import attention
+from packed_encoders.cpu import attention, build
 from packed_encoders.errors import PackedEncodersError
 
 
 @pytest.mark.parametrize('fail', [False, True])
 @pytest.mark.parametrize('cpus', [1, 3])
 def test_x86_compilers_finish_before_link_or_cleanup(monkeypatch, fail, cpus):
+    monkeypatch.setenv('PACKED_ENCODERS_CPU_CACHE_DIR', '')
     monkeypatch.setattr(attention, '_openmp_runtime', lambda: '/tmp/libgomp.so')
     monkeypatch.setattr(attention.shutil, 'which', lambda name: '/usr/bin/gcc')
-    monkeypatch.setattr(attention.os, 'sched_getaffinity', lambda pid: set(range(cpus)), raising=False)
+    monkeypatch.setattr(build.os, 'sched_getaffinity', lambda pid: set(range(cpus)), raising=False)
     barrier = threading.Barrier(cpus, timeout=5)
     failed = threading.Event()
     completed = set()

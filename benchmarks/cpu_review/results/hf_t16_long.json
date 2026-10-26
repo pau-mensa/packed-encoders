@@ -1,0 +1,63 @@
+{
+  "args": {
+    "system": "hf",
+    "threads": 16,
+    "precision": "fp32",
+    "backend": "auto",
+    "model": null,
+    "spin": 1,
+    "only": "b32_s1024,b32_rand_pad1024",
+    "trials": 3,
+    "out": "benchmarks/cpu_review/results/hf_t16_long.json"
+  },
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "transformers": "5.3.0",
+    "onnxruntime": "1.31.0"
+  },
+  "platform": "Linux-7.2.7-arch1-1-x86_64-with-glibc2.44",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "rows": {
+    "b32_rand_pad1024": {
+      "median_ms": 9640.068853999992,
+      "samples_ms": [
+        9640.068853999992,
+        9631.92763699999,
+        9712.893059999942
+      ],
+      "live_tokens": 17837,
+      "relL2": 0.0,
+      "cos_min": 0.9999992847442627,
+      "cos_median": 1.0
+    },
+    "b32_s1024": {
+      "median_ms": 9773.824679000085,
+      "samples_ms": [
+        9773.824679000085,
+        9646.239910999953,
+        9807.974694999984
+      ],
+      "live_tokens": 32768,
+      "relL2": 0.0,
+      "cos_min": 0.9999993443489075,
+      "cos_median": 1.0
+    }
+  }
+}

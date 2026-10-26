@@ -98,6 +98,23 @@ def test_projection_after_real_replay_and_owned_outputs(dtype, bias):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("normalize", [False, True])
+def test_builtin_projection_output_survives_real_graph_replay(normalize):
+    device = torch.device("cuda", torch.cuda.device_count() - 1)
+    runtime = GraphBackbone(device)
+    try:
+        projection = nn.Linear(16, 7, device=device, dtype=torch.bfloat16)
+        encoder = runtime.with_epilogue(pe.epilogues.TokenProjection(projection, normalize=normalize))
+        inputs = pe.PackedBatch(torch.arange(8, device=device), host_lengths=(3, 5))
+        actual = encoder.forward_packed(inputs)
+        expected = actual.clone()
+        encoder.forward_packed(pe.PackedBatch(inputs.input_ids + 8, host_lengths=(3, 5)))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        runtime.close()
+
+
+@torch.no_grad()
 def test_modernbert_cuda_projection_matches_packed_hidden_states():
     from transformers import ModernBertConfig, ModernBertModel
     from packed_encoders.arch.modernbert import ModernBert

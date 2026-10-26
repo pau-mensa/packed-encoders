@@ -1,0 +1,11 @@
+--- a/packed_encoders/cpu/int8.py
++++ b/packed_encoders/cpu/int8.py
+@@ -154,7 +154,7 @@
+     diagonal = torch.diagonal(h)
+     dead = diagonal == 0
+     diagonal[dead] = 1
+-    h += damp * diagonal.mean() * torch.eye(h.shape[0], dtype=h.dtype)
++    diagonal.add_(damp * diagonal.mean())
+     return torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(h)), upper=True).float(), dead
+ 
+ 

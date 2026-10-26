@@ -144,7 +144,10 @@ class PreparedLinear:
             with self._context._device_context():
                 # Native kernels may reuse scratch; branches and consecutive
                 # same-width projections must not overwrite their inputs.
-                return self._execute(x).clone()
+                return self._execute_owned(x)
+
+    def _execute_owned(self, x):
+        return self._execute(x).clone()
 
     def _execute(self, x):
         raise NotImplementedError
@@ -181,7 +184,8 @@ class PackedEpilogue:
                     raise PackedEncodersError("epilogue output width and dtype must agree across chunks")
                 signature = current
                 # Custom heads may return views of graph output or their own scratch.
-                return output.clone()
+                return (output if getattr(self._forward, "_packed_encoders_owned_output", False)
+                        else output.clone())
 
             with self._context._device_context():
                 return self._runtime._forward_epilogue(batch, apply)

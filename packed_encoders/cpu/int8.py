@@ -19,11 +19,11 @@ from operator import attrgetter
 from pathlib import Path
 import platform
 import subprocess
-import tempfile
 
 import torch
 import torch.nn.functional as F
 
+from packed_encoders.cpu.build import shared_library
 from packed_encoders.cpu.attention import _openmp_runtime
 from packed_encoders.cpu.sme import sme2_available
 from packed_encoders.errors import PackedEncodersError, UnsupportedTargetError
@@ -75,32 +75,26 @@ def x86():
 
 @lru_cache(maxsize=1)
 def library():
-    # Process-private directory, as for the attention library. Streaming SME code needs
-    # an SME2 target; only this translation unit is built for it. On x86, gcc builds it
-    # against PyTorch's OpenMP runtime, as the attention library.
-    directory = tempfile.TemporaryDirectory(prefix="packed-encoders-int8-")
-    here, out = Path(__file__).parent, Path(directory.name)
+    directory = None
+    here = Path(__file__).parent
     try:
+        runtime = _openmp_runtime() if x86() else None
         if x86():
-            runtime = _openmp_runtime()
             if runtime is None:
                 raise OSError("PyTorch's OpenMP runtime not found")
-            subprocess.run(
-                ["gcc", "-O3", "-march=native", "-fPIC", "-fopenmp", "-ffp-contract=off", "-fno-trapping-math",
-                 "-fno-math-errno", "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-shared",
-                 str(here / "int8_x86.c"), runtime, f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(out / "int8.so")],
-                check=True, capture_output=True, timeout=60,
-            )
-            lib = ctypes.CDLL(str(out / "int8.so"))
+            name = "int8.so"
+            command = ["gcc", "-O3", "-march=native", "-fPIC", "-fopenmp", "-ffp-contract=off", "-fno-trapping-math",
+                       "-fno-math-errno", "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-shared",
+                       str(here / "int8_x86.c"), runtime, f"-Wl,-rpath,{Path(runtime).parent}", "-o", "{build}/" + name]
         else:
-            subprocess.run(
-                ["xcrun", "clang", "-O3", "-mcpu=apple-m4", "-Wall", "-Wextra", "-Werror", "-dynamiclib",
-                 str(here / "int8.c"), "-o", str(out / "int8.dylib")],
-                check=True, capture_output=True, timeout=60,
-            )
-            lib = ctypes.CDLL(str(out / "int8.dylib"))
+            name = "int8.dylib"
+            command = ["xcrun", "clang", "-O3", "-mcpu=apple-m4", "-Wall", "-Wextra", "-Werror", "-dynamiclib",
+                       str(here / "int8.c"), "-o", "{build}/" + name]
+        path, directory = shared_library(name, [command], runtime=runtime)
+        lib = ctypes.CDLL(str(path))
     except (OSError, subprocess.SubprocessError) as exc:
-        directory.cleanup()
+        if directory is not None:
+            directory.cleanup()
         raise Int8Unavailable("precision='int8' needs gcc with OpenMP" if x86() else
                               "precision='int8' needs the Xcode Command Line Tools with Apple M4 support "
                               "(xcrun clang -mcpu=apple-m4)") from exc
@@ -346,7 +340,8 @@ class Int8Projections:
         q, k, v = rope.unbind(0)
         att, longest = engine.attention, max(lengths)
         native_args = None
-        if self.x86 and att.native_local and att.native_global and att.token_major and longest <= 128:
+        if (self.x86 and att.native_local and att.native_global and att.token_major and longest <= 128
+                and att._use_native(True, lengths) and att._use_native(False, lengths)):
             # Global attention reserves the largest scratch window. Preparing local
             # attention afterwards cannot invalidate the global call's pointers.
             context, global_args = att._native_args(q, k, v, lengths, boundaries, longest, True)

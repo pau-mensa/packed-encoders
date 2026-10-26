@@ -1,0 +1,4 @@
+{"kind": "correctness", "threads": 1, "isa": "native", "cases": 240, "bitwise_equal": true}
+{"kind": "correctness", "threads": 8, "isa": "native", "cases": 240, "bitwise_equal": true}
+{"kind": "correctness", "threads": 1, "isa": "x86-64-v3", "cases": 240, "bitwise_equal": true}
+{"kind": "correctness", "threads": 8, "isa": "x86-64-v3", "cases": 240, "bitwise_equal": true}
