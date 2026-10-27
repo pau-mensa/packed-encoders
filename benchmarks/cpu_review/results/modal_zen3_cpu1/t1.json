@@ -1,0 +1,1231 @@
+{
+  "cpu": "unknown",
+  "torch": "2.11.0+cpu",
+  "threads": 1,
+  "affinity": [
+    0,
+    1
+  ],
+  "isa": "native",
+  "heads": 12,
+  "max_seqlen": 8192,
+  "max_tokens": 32768,
+  "OMP_WAIT_POLICY": null,
+  "rows": [
+    {
+      "round": 0,
+      "method": "baseline",
+      "seconds": 9.676594137999999,
+      "calls": {
+        "native": 120,
+        "sdpa": 120
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.149263,
+            "sdpa": 0.09599966666666668
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.1423763333333332,
+            "sdpa": 0.136403
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.015778333333333,
+            "sdpa": 0.7239563333333334
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.020125,
+            "sdpa": 0.997403
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.732603666666666,
+            "sdpa": 0.8171233333333334
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.951647666666666,
+            "sdpa": 0.977283
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.15068933333333,
+            "sdpa": 10.571207666666666
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.40014633333332,
+            "sdpa": 12.612940666666667
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.74534633333334,
+            "sdpa": 5.060889
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 421.2990163333333,
+            "sdpa": 52.112813333333335
+          }
+        }
+      }
+    },
+    {
+      "round": 0,
+      "method": "single",
+      "seconds": 3.2208717779999994,
+      "calls": {
+        "native": 40,
+        "sdpa": 40
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.15787,
+            "sdpa": 0.11521
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16511,
+            "sdpa": 0.14304
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.112818,
+            "sdpa": 0.74765
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.113758,
+            "sdpa": 1.01489
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.326757,
+            "sdpa": 0.82881
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.957698,
+            "sdpa": 1.00305
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.236499,
+            "sdpa": 7.112669
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.437803,
+            "sdpa": 7.869298
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.773329,
+            "sdpa": 5.15505
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 424.071528,
+            "sdpa": 48.22024
+          }
+        }
+      }
+    },
+    {
+      "round": 0,
+      "method": "adaptive",
+      "seconds": 3.229973605999998,
+      "calls": {
+        "native": 40,
+        "sdpa": 52
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.178419,
+            "sdpa": 0.11099
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.17324,
+            "sdpa": 0.14261333333333334
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.186908,
+            "sdpa": 0.78687
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.165948,
+            "sdpa": 1.0254
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.327157,
+            "sdpa": 0.82258
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 11.030787,
+            "sdpa": 0.99979
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.192129,
+            "sdpa": 6.619969
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.574862,
+            "sdpa": 7.944099
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.81894,
+            "sdpa": 5.046059
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 423.334568,
+            "sdpa": 52.71837
+          }
+        }
+      }
+    },
+    {
+      "round": 1,
+      "method": "adaptive",
+      "seconds": 3.2452328160000015,
+      "calls": {
+        "native": 40,
+        "sdpa": 52
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.15884,
+            "sdpa": 0.11062
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16391,
+            "sdpa": 0.14408666666666667
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.097178,
+            "sdpa": 0.79455
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.102668,
+            "sdpa": 1.03233
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.230148,
+            "sdpa": 0.82061
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.938418,
+            "sdpa": 0.99898
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.023097,
+            "sdpa": 7.697268
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.265653,
+            "sdpa": 7.775419
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.9223,
+            "sdpa": 5.096529
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 425.880226,
+            "sdpa": 52.66861
+          }
+        }
+      }
+    },
+    {
+      "round": 1,
+      "method": "single",
+      "seconds": 3.2183421649999993,
+      "calls": {
+        "native": 40,
+        "sdpa": 40
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16146,
+            "sdpa": 0.12084
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16887,
+            "sdpa": 0.15515
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.160899,
+            "sdpa": 0.7749
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.121639,
+            "sdpa": 1.030259
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.301497,
+            "sdpa": 0.820129
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.942927,
+            "sdpa": 0.99043
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.299509,
+            "sdpa": 6.621639
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.725112,
+            "sdpa": 7.853028
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.969869,
+            "sdpa": 5.024709
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 423.044171,
+            "sdpa": 51.16453
+          }
+        }
+      }
+    },
+    {
+      "round": 1,
+      "method": "baseline",
+      "seconds": 9.569990521000001,
+      "calls": {
+        "native": 120,
+        "sdpa": 120
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.1547933333333333,
+            "sdpa": 0.10193666666666668
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.1522596666666667,
+            "sdpa": 0.13921666666666666
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.089511333333334,
+            "sdpa": 0.7270366666666667
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.097884666666666,
+            "sdpa": 1.0048133333333333
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.283423666666666,
+            "sdpa": 0.8139763333333334
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.944468,
+            "sdpa": 0.9773563333333334
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 105.874898,
+            "sdpa": 6.577572
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.779152,
+            "sdpa": 7.977195
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.871413,
+            "sdpa": 5.228029
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 423.89717,
+            "sdpa": 49.51259
+          }
+        }
+      }
+    },
+    {
+      "round": 2,
+      "method": "baseline",
+      "seconds": 9.583355256000004,
+      "calls": {
+        "native": 120,
+        "sdpa": 120
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.1597566666666668,
+            "sdpa": 0.10262
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16119,
+            "sdpa": 0.13298966666666664
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.169911666666666,
+            "sdpa": 0.754093
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.250358,
+            "sdpa": 1.0626763333333333
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.259774333333334,
+            "sdpa": 0.8237396666666666
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.937118,
+            "sdpa": 0.9758133333333334
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.21025233333333,
+            "sdpa": 6.705962
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.45178166666668,
+            "sdpa": 7.904301666666667
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 53.00350666666667,
+            "sdpa": 5.043742333333333
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 424.5067676666667,
+            "sdpa": 52.10201033333333
+          }
+        }
+      }
+    },
+    {
+      "round": 2,
+      "method": "single",
+      "seconds": 3.290746980999998,
+      "calls": {
+        "native": 40,
+        "sdpa": 40
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.15985,
+            "sdpa": 0.12572
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.15566,
+            "sdpa": 0.15369
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.107118,
+            "sdpa": 0.79135
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.098838,
+            "sdpa": 1.03818
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.243047,
+            "sdpa": 0.82087
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.926068,
+            "sdpa": 0.98723
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 105.799529,
+            "sdpa": 6.818638
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 88.364893,
+            "sdpa": 8.759158
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 53.125889,
+            "sdpa": 5.570909
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 425.352028,
+            "sdpa": 55.58385
+          }
+        }
+      }
+    },
+    {
+      "round": 2,
+      "method": "adaptive",
+      "seconds": 3.3157946700000025,
+      "calls": {
+        "native": 40,
+        "sdpa": 52
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16077,
+            "sdpa": 0.10411333333333332
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16004,
+            "sdpa": 0.15141666666666664
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.103499,
+            "sdpa": 0.80953
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.071288,
+            "sdpa": 1.10554
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.178147,
+            "sdpa": 0.81471
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.885988,
+            "sdpa": 1.049869
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 105.62975,
+            "sdpa": 7.602338
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.919082,
+            "sdpa": 8.425418
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 53.02658,
+            "sdpa": 5.071649
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 423.883303,
+            "sdpa": 71.129665
+          }
+        }
+      }
+    },
+    {
+      "round": 3,
+      "method": "adaptive",
+      "seconds": 3.228292379999999,
+      "calls": {
+        "native": 40,
+        "sdpa": 52
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.18518,
+            "sdpa": 0.10499333333333333
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16911,
+            "sdpa": 0.13948
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.106899,
+            "sdpa": 0.78462
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.180639,
+            "sdpa": 1.039389
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.231337,
+            "sdpa": 0.822779
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.958517,
+            "sdpa": 1.02775
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.244729,
+            "sdpa": 6.652079
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.551682,
+            "sdpa": 8.166178
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.907059,
+            "sdpa": 5.112869
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 423.707536,
+            "sdpa": 49.18426
+          }
+        }
+      }
+    },
+    {
+      "round": 3,
+      "method": "single",
+      "seconds": 3.2659590860000023,
+      "calls": {
+        "native": 40,
+        "sdpa": 40
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.15415,
+            "sdpa": 0.11815
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.15489,
+            "sdpa": 0.14963
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.111088,
+            "sdpa": 0.77487
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.091848,
+            "sdpa": 1.015
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.320998,
+            "sdpa": 0.81904
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.973328,
+            "sdpa": 1.02432
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 107.484398,
+            "sdpa": 7.304748
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.423393,
+            "sdpa": 7.842998
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.8988,
+            "sdpa": 5.094599
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 425.135687,
+            "sdpa": 51.912959
+          }
+        }
+      }
+    },
+    {
+      "round": 3,
+      "method": "baseline",
+      "seconds": 9.715358347000006,
+      "calls": {
+        "native": 120,
+        "sdpa": 120
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.2205596666666667,
+            "sdpa": 0.09621666666666667
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.21962,
+            "sdpa": 0.14449633333333334
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.358604666666666,
+            "sdpa": 0.7608196666666667
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.421954666666666,
+            "sdpa": 1.0918663333333332
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.943547,
+            "sdpa": 0.8691163333333334
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 11.393671,
+            "sdpa": 1.037693
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 111.10866833333333,
+            "sdpa": 7.380585
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 90.28088733333333,
+            "sdpa": 8.145081666666666
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 54.401,
+            "sdpa": 5.229925666666667
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 424.450155,
+            "sdpa": 50.90090333333334
+          }
+        }
+      }
+    },
+    {
+      "round": 4,
+      "method": "baseline",
+      "seconds": 9.550693553000002,
+      "calls": {
+        "native": 120,
+        "sdpa": 120
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.1523233333333334,
+            "sdpa": 0.10435666666666667
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.1543963333333334,
+            "sdpa": 0.14365966666666666
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.120238,
+            "sdpa": 0.7533896666666666
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.123758,
+            "sdpa": 1.0272863333333333
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.298187333333335,
+            "sdpa": 0.8128496666666666
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.957701,
+            "sdpa": 0.9792796666666667
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.36294933333333,
+            "sdpa": 6.734505333333333
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.68696266666667,
+            "sdpa": 7.830865
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.88834966666666,
+            "sdpa": 4.995189
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 424.40825233333334,
+            "sdpa": 49.586243333333336
+          }
+        }
+      }
+    },
+    {
+      "round": 4,
+      "method": "single",
+      "seconds": 3.230645119000002,
+      "calls": {
+        "native": 40,
+        "sdpa": 40
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.16337,
+            "sdpa": 0.10351
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.15862,
+            "sdpa": 0.15121
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.143009,
+            "sdpa": 0.75046
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.164619,
+            "sdpa": 1.0642
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.764678,
+            "sdpa": 0.97405
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 10.939319,
+            "sdpa": 0.99267
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 106.621853,
+            "sdpa": 7.332709
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.867376,
+            "sdpa": 8.377469
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 52.801849,
+            "sdpa": 5.727588
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 425.189537,
+            "sdpa": 51.54549
+          }
+        }
+      }
+    },
+    {
+      "round": 4,
+      "method": "adaptive",
+      "seconds": 3.2765260080000047,
+      "calls": {
+        "native": 40,
+        "sdpa": 52
+      },
+      "buckets": {
+        "(False, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.1637,
+            "sdpa": 0.10393666666666668
+          }
+        },
+        "(True, 32, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 1.163839,
+            "sdpa": 0.14076
+          }
+        },
+        "(False, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.193198,
+            "sdpa": 0.7847
+          }
+        },
+        "(True, 32, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 9.142878,
+            "sdpa": 1.05796
+          }
+        },
+        "(False, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 13.323668,
+            "sdpa": 0.83621
+          }
+        },
+        "(True, 128, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 11.014728,
+            "sdpa": 0.9985
+          }
+        },
+        "(False, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 113.920098,
+            "sdpa": 9.709828
+          }
+        },
+        "(True, 128, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 87.899462,
+            "sdpa": 8.721518
+          }
+        },
+        "(True, 512, 1)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 53.605879,
+            "sdpa": 5.214549
+          }
+        },
+        "(True, 512, 8)": {
+          "selected": "sdpa",
+          "median_ms": {
+            "native": 421.087177,
+            "sdpa": 52.42629
+          }
+        }
+      }
+    }
+  ]
+}

@@ -236,14 +236,20 @@ class CPUAttention:
                             "native": lambda: self._native(q, k, v, lengths, boundaries, half, True),
                             "sdpa": lambda: self._layout(self._sdpa(q, k, v, lengths, local=local), True),
                         }
-                        samples = {name: [] for name in calls}
-                        for round_ in range(4):  # warm both, then alternate to limit order bias
-                            for name in calls if round_ % 2 == 0 else reversed(calls):
+                        repeats, samples = {}, {name: [] for name in calls}
+                        for name, call in calls.items():
+                            start = time.perf_counter_ns()
+                            call()
+                            elapsed = max(1, time.perf_counter_ns() - start)
+                            # Amortize timing overhead for fast calls, but keep slow
+                            # samples to one call. Both retain three measured rounds.
+                            repeats[name] = min(3, max(1, 1_000_000 // elapsed))
+                        for round_ in range(3):  # alternate to limit order bias
+                            for name in reversed(calls) if round_ % 2 == 0 else calls:
                                 start = time.perf_counter_ns()
-                                for _ in range(3):
+                                for _ in range(repeats[name]):
                                     calls[name]()
-                                if round_:
-                                    samples[name].append((time.perf_counter_ns() - start) / 3e6)
+                                samples[name].append((time.perf_counter_ns() - start) / repeats[name] / 1e6)
                         medians = {name: statistics.median(values) for name, values in samples.items()}
                         selected = "native" if medians["native"] < .95 * medians["sdpa"] else "sdpa"
                         self.attention_tuning[local, length, count] = {

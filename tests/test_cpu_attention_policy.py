@@ -88,3 +88,31 @@ def test_small_token_budget_bounds_calibration(monkeypatch):
     monkeypatch.setattr(cpu, "_sdpa", check)
     cpu.tune_attention(2, 256, 3)
     assert set(cpu.attention_tuning) == {(False, 3, 1), (True, 3, 1)}
+
+
+@pytest.mark.parametrize("native_ns,sdpa_ns", [(2_000_000, 100_000), (100_000, 2_000_000)])
+def test_tuning_repeats_fast_calls_without_batching_slow_calls(monkeypatch, native_ns, sdpa_ns):
+    monkeypatch.setattr(attention.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(attention.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(attention, "_x86_library", lambda: (object(), None))
+    cpu = attention.CPUAttention("auto", 64, 64, 1)
+    clock, calls = 0, {"native": 0, "sdpa": 0}
+
+    def timed(name, elapsed):
+        def call(q, *args, **kwargs):
+            nonlocal clock
+            clock += elapsed
+            calls[name] += 1
+            return q
+        return call
+
+    monkeypatch.setattr(cpu, "_native", timed("native", native_ns))
+    monkeypatch.setattr(cpu, "_sdpa", timed("sdpa", sdpa_ns))
+    monkeypatch.setattr(attention.time, "perf_counter_ns", lambda: clock)
+    cpu.tune_attention(2, 256, 3)
+    for name, elapsed in (("native", native_ns), ("sdpa", sdpa_ns)):
+        # Two buckets, each with one warmup and three measured samples.
+        assert calls[name] == 2 * (1 + 3 * (3 if elapsed < 1_000_000 else 1))
+    for bucket in cpu.attention_tuning.values():
+        assert bucket["selected"] == ("native" if native_ns < sdpa_ns else "sdpa")
+        assert bucket["median_ms"] == {"native": native_ns / 1e6, "sdpa": sdpa_ns / 1e6}
