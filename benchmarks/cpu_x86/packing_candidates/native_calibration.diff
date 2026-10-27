@@ -1,0 +1,11 @@
+--- a/packed_encoders/cpu/int8.py
++++ b/packed_encoders/cpu/int8.py
+@@ -196,7 +196,7 @@
+         grams[kind] = rows.T @ rows
+         if all(gram is not None for gram in grams):
+             layer_done(index, pending.pop(index))
+-        return F.linear(x, weight, bias)
++        return engine.attention.linear(x, weight, bias)
+ 
+     # One batch regardless of max_tokens, so the prepared weights depend only on the model.
+     length = min(CALIBRATION_LENGTH, engine.max_position)

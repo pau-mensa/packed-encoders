@@ -1,0 +1,63 @@
+{
+  "args": {
+    "system": "ort",
+    "threads": 16,
+    "precision": "int8",
+    "backend": "auto",
+    "model": "/tmp/pe-pr15-onnx-models/int8_w8a8.onnx",
+    "spin": 1,
+    "only": "b32_s1024,b32_rand_pad1024",
+    "trials": 3,
+    "out": "benchmarks/cpu_review/results/ort_w8a8_t16_long.json"
+  },
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "transformers": "5.3.0",
+    "onnxruntime": "1.31.0"
+  },
+  "platform": "Linux-7.2.7-arch1-1-x86_64-with-glibc2.44",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "rows": {
+    "b32_rand_pad1024": {
+      "median_ms": 6508.241360000056,
+      "samples_ms": [
+        6508.241360000056,
+        6421.114626999952,
+        6579.806654999857
+      ],
+      "live_tokens": 17837,
+      "relL2": 0.11360689997673035,
+      "cos_min": 0.20645689964294434,
+      "cos_median": 0.9980733394622803
+    },
+    "b32_s1024": {
+      "median_ms": 15969.71935700003,
+      "samples_ms": [
+        15969.71935700003,
+        15837.17019400001,
+        16007.591304000016
+      ],
+      "live_tokens": 32768,
+      "relL2": 0.10024422407150269,
+      "cos_min": 0.23988734185695648,
+      "cos_median": 0.9983474016189575
+    }
+  }
+}

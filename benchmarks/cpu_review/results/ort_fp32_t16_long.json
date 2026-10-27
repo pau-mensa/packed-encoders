@@ -1,0 +1,63 @@
+{
+  "args": {
+    "system": "ort",
+    "threads": 16,
+    "precision": "fp32",
+    "backend": "auto",
+    "model": "/tmp/pe-pr15-onnx-models/fp32_opt.onnx",
+    "spin": 1,
+    "only": "b32_s1024,b32_rand_pad1024",
+    "trials": 3,
+    "out": "benchmarks/cpu_review/results/ort_fp32_t16_long.json"
+  },
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "transformers": "5.3.0",
+    "onnxruntime": "1.31.0"
+  },
+  "platform": "Linux-7.2.7-arch1-1-x86_64-with-glibc2.44",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "rows": {
+    "b32_rand_pad1024": {
+      "median_ms": 6677.223385000161,
+      "samples_ms": [
+        6668.550308000022,
+        6738.4073819998775,
+        6677.223385000161
+      ],
+      "live_tokens": 17837,
+      "relL2": 7.43733608032926e-06,
+      "cos_min": 0.9999993443489075,
+      "cos_median": 1.0
+    },
+    "b32_s1024": {
+      "median_ms": 16073.873201999959,
+      "samples_ms": [
+        16073.873201999959,
+        16773.376437000024,
+        15945.29839400002
+      ],
+      "live_tokens": 32768,
+      "relL2": 6.614790436287876e-06,
+      "cos_min": 0.9999992847442627,
+      "cos_median": 1.0
+    }
+  }
+}

@@ -1,7 +1,7 @@
 """ONNX Runtime baselines on the same workloads as bench.py (same ids, seed 0), FP32 and int8.
 
     python benchmarks/cpu_avx2/onnx_bench.py --threads 8 --out results/o_t8_short.json \
-        --models fp32_opt,int8 --only b1_s32,b8_s32 --spin 1,0 --trials 20
+        --models fp32_opt,int8_w8a8 --only b1_s32,b8_s32 --spin 1,0 --trials 20
 
 Models come from onnx_export.py. Protocol follows the CPU engine's published ONNX baseline:
 intra-op threads = --threads, sequential execution, ORT_ENABLE_ALL, and the faster of intra-op
@@ -61,7 +61,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--threads", type=int, required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--models", default="fp32_opt,int8")
+    ap.add_argument("--models", default="fp32_opt,int8_w8a8")
     ap.add_argument("--only", required=True)
     ap.add_argument("--spin", default="1,0")
     ap.add_argument("--trials", type=int, default=5)

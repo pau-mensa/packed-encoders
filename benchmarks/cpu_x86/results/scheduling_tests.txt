@@ -1,0 +1,11 @@
+........................................ssssssssssss..............sssss. [ 33%]
+................................sssssssssssssssssssssssssss....sssssssss [ 66%]
+ssssssssssssss.............................ssssssssssssss......sssssssss [ 99%]
+ss                                                                       [100%]
+=============================== warnings summary ===============================
+tests/test_modernbert_cpu.py: 26 warnings
+  /home/pau/development/packed-encoders/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:1061: UserWarning: Can't initialize NVML
+    raw_cnt = _raw_device_count_nvml()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+126 passed, 96 skipped, 26 warnings in 7.64s

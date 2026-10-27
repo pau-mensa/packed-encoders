@@ -1,0 +1,181 @@
+{
+  "args": {
+    "system": "engine",
+    "threads": 32,
+    "native_threads": "default",
+    "precision": "fp32",
+    "backend": "auto",
+    "model": null,
+    "spin": 1,
+    "only": "b1_s32,b8_s32",
+    "trials": 7,
+    "warmup": 1,
+    "ort_row_warmup": false,
+    "out": "benchmarks/cpu_review/results/thread_defaults/engine_default.json"
+  },
+  "date": "2026-10-25",
+  "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+  "platform": "Linux-7.2.7-arch1-1-x86_64-with-glibc2.44",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "torch_threads": 32,
+  "omp_wait_policy": null,
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "transformers": "5.3.0",
+    "onnxruntime": "1.31.0"
+  },
+  "rows": {
+    "b1_s32": {
+      "median_ms": 17.205654000008508,
+      "samples_ms": [
+        18.219016999864834,
+        19.42696200012506,
+        11.946787999931985,
+        15.944928999942931,
+        12.541116000193142,
+        17.93497300013769,
+        17.205654000008508
+      ],
+      "lengths": [
+        32
+      ],
+      "live_tokens": 32,
+      "relL2": 5.782521384389838e-06,
+      "cos_min": 0.9999997615814209,
+      "cos_median": 1.0
+    },
+    "b8_s32": {
+      "median_ms": 80.50138199996582,
+      "samples_ms": [
+        57.110049999664625,
+        79.7665129998677,
+        91.28562499972759,
+        80.50138199996582,
+        61.818969000341895,
+        85.49363400015864,
+        83.77080199988995
+      ],
+      "lengths": [
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32
+      ],
+      "live_tokens": 256,
+      "relL2": 2.351536977585056e-06,
+      "cos_min": 0.9999997615814209,
+      "cos_median": 1.0
+    }
+  },
+  "pack_s": 0.9607447579996915,
+  "native_threads": 16,
+  "attention_tuning": {
+    "(False, 32, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.011023333333333333,
+        "sdpa": 0.02426033333333333
+      }
+    },
+    "(True, 32, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.00943,
+        "sdpa": 0.043084
+      }
+    },
+    "(False, 32, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.026203666666666667,
+        "sdpa": 0.22055933333333333
+      }
+    },
+    "(True, 32, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.026153666666666665,
+        "sdpa": 0.3029036666666667
+      }
+    },
+    "(False, 128, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.04508366666666667,
+        "sdpa": 0.086551
+      }
+    },
+    "(True, 128, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.04770066666666667,
+        "sdpa": 0.9062213333333333
+      }
+    },
+    "(False, 128, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.25677,
+        "sdpa": 3.7852936666666666
+      }
+    },
+    "(True, 128, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.26178,
+        "sdpa": 5.961407333333334
+      }
+    },
+    "(True, 512, 1)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 0.16409866666666667,
+        "sdpa": 2.14711
+      }
+    },
+    "(True, 512, 8)": {
+      "selected": "native",
+      "median_ms": {
+        "native": 1.1797646666666666,
+        "sdpa": 21.089159
+      }
+    }
+  }
+}

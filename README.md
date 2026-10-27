@@ -118,6 +118,13 @@ For the tested environments and remaining performance checks, see
 - GPU: bf16 weights for inference, or fp32 master weights under bf16 autocast for training.
 - CPU: ModernBERT with FP32 weights; install with `uv pip install --no-sources --torch-backend cpu -e .` on Linux. Native kernels run on Apple Silicon (Accelerate, built with Xcode Command Line Tools) and Linux x86-64 (built with `gcc`; the FP32 projection GEMM needs AVX-512). On supported Apple Silicon with SME2, FP32 projections use a [prepared SME2 GEMM](docs/modernbert-cpu-sme.md) (short inputs on one thread, up to 4,096 packed tokens with four or more threads); the weight copies add about 421 MiB for ModernBERT-base and can be disabled with `ModernBertCPU(prepack_weights=False)`. Opt-in int8 (`precision="int8"`) needs an Apple M4 (SME2) or an x86 CPU with AVX512-VNNI. Other CPUs, or machines without the compiler, use tiled PyTorch SDPA and PyTorch ops. See [CPU runtime](docs/modernbert-cpu.md).
 
+On Linux x86-64, automatic CPU attention selection measures native attention and
+SDPA during packing, including on AVX2 CPUs. Default native workers respect the
+current Linux affinity mask, counting physical cores when topology is available;
+explicit `threads=` overrides this limit. See the
+[CPU review follow-up](benchmarks/cpu_review/README.md) for benchmark comparisons
+against HF SDPA, trimmed ONNX FP32 and MatMulNBits W8A8.
+
 ## ⚡️ Quick Start
 
 CPU and CUDA retrievers can attach a prepared projection or custom head with

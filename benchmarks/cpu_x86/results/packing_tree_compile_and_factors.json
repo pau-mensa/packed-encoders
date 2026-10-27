@@ -1,0 +1,46 @@
+{
+  "label": "tree_probe",
+  "source": "/tmp/modernbert-packing-candidates/compile_and_factors",
+  "precision": "int8",
+  "threads": 8,
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "pack_s": 4.750522450000062,
+  "rss_before_mib": 837.2421875,
+  "rss_after_mib": 1607.3515625,
+  "rss_after_gc_mib": 1607.33203125,
+  "peak_pack_rss_mib": 1752.2578125,
+  "peak_extra_mib": 915.015625,
+  "hwm_before_mib": 834.53515625,
+  "hwm_after_mib": 1752.2578125,
+  "sampled_peak_mib": 1754.421875,
+  "memory_samples": 916,
+  "prepared_mib": 106.21875,
+  "validation": {
+    "attention_backend": "native",
+    "min_cosine": 0.9964455366134644,
+    "relative_l2": 0.04184335842728615,
+    "max_abs": 1.0150339603424072,
+    "sequence_lengths": [
+      7,
+      129
+    ],
+    "precision": "int8",
+    "median_cosine": 0.9992289543151855
+  },
+  "warnings": [],
+  "torch": "2.11.0+cu128",
+  "prepared_sha256": "30930259c0875ba7ec4a286a139e011907254b7d567ed842cb06a13364d23977",
+  "rss_after_unpack_mib": 1462.6796875,
+  "tree_peak_rss_mib": 1744.36328125,
+  "compiler_children_peak_rss_mib": 362.4375,
+  "tree_samples": 703
+}

@@ -1,0 +1,8 @@
+threads=1 backend=native rows=native rounds=15
+b1_s16_pad32  | mmap    19.64 [19.59-19.69] ( +0.00 ms, 1.00x, relL2 0.0e+00) | rehome    18.23 [18.19-18.29] ( +1.41 ms, 1.08x, relL2 0.0e+00)
+b1_s32        | mmap    30.02 [29.99-30.05] ( +0.00 ms, 1.00x, relL2 0.0e+00) | rehome    27.88 [27.83-27.90] ( +2.14 ms, 1.08x, relL2 0.0e+00)
+b8_s32        | mmap   200.81 [200.56-200.93] ( +0.00 ms, 1.00x, relL2 0.0e+00) | rehome   194.19 [194.11-194.48] ( +6.62 ms, 1.03x, relL2 0.0e+00)
+threads=8 backend=native rows=native rounds=15
+b1_s16_pad32  | mmap     8.49 [8.46-8.52] ( +0.00 ms, 1.00x, relL2 0.0e+00) | rehome     8.47 [8.43-8.50] ( +0.02 ms, 1.00x, relL2 0.0e+00)
+b1_s32        | mmap     8.92 [8.90-8.94] ( +0.00 ms, 1.00x, relL2 0.0e+00) | rehome     8.83 [8.81-8.86] ( +0.09 ms, 1.01x, relL2 0.0e+00)
+b8_s32        | mmap    29.33 [29.31-29.45] ( +0.00 ms, 1.00x, relL2 0.0e+00) | rehome    29.11 [29.07-29.15] ( +0.23 ms, 1.01x, relL2 0.0e+00)

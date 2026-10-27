@@ -12,14 +12,10 @@ The installable CPU engine is documented in
 [`../docs/modernbert-cpu.md`](../docs/modernbert-cpu.md). The notes below are the
 research behind it.
 
-[`docs/modernbert-cpu.md`](docs/modernbert-cpu.md) describes the initial M4 Pro
-ModernBERT layer probe, optimized ONNX Runtime baselines, and the experimental
-Accelerate local-attention kernel. These are synthetic FP32 CPU experiments,
-not full-model performance claims.
-
-[`docs/modernbert-cpu-full.md`](docs/modernbert-cpu-full.md) extends this to the
-pretrained 22-layer encoder, including ragged document/query batches, long single
-documents, full-output parity checks and memory-bounded ONNX baselines.
+The initial M4 layer-probe and full-model research notes are not included in this
+checkout. The [SME2 guide](../docs/modernbert-cpu-sme.md) documents the current Apple
+projection path; the [review follow-up](cpu_review/README.md) contains the paired
+HF, trimmed ONNX and MatMulNBits W8A8 comparisons and reproduction commands.
 
 [`cpu_x86/README.md`](cpu_x86/README.md) covers the x86 port (Ryzen 9 9950X, Zen 5):
 native row and attention kernels, the native FP32 projection GEMM, AVX512-VNNI int8,

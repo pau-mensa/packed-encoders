@@ -42,4 +42,7 @@ class TokenProjection:
             output = project(hidden)
             return F.normalize(output, p=2, dim=-1) if self.normalize else output
 
+        # Both prepared projections and F.normalize return owned tensors. The
+        # shared wrapper need not clone this built-in head's result a second time.
+        forward._packed_encoders_owned_output = True
         return forward

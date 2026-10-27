@@ -1,6 +1,6 @@
 """Attention ablation for the packed CPU engine (engine only, FP32).
 
-    python benchmarks/cpu_avx2/attention_ablation.py --threads 8 --mode native|sdpa_attn --tag X --out results/abl_X_t8.json [--dump out.pt]
+    python benchmarks/cpu_avx2/attention_ablation.py --threads 8 --mode auto|native|sdpa_attn --tag X --out results/abl_X_t8.json [--dump out.pt]
 
 native: the engine's own attention kernels. sdpa_attn: the engine's private switches route
 local and global attention through its tiled PyTorch SDPA path (row kernels unchanged).
@@ -23,7 +23,7 @@ from bench import MODEL, workloads
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--threads", type=int, required=True)
-    ap.add_argument("--mode", choices=("native", "sdpa_attn"), required=True)
+    ap.add_argument("--mode", choices=("auto", "native", "sdpa_attn"), required=True)
     ap.add_argument("--tag", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--trials", type=int, default=7)
@@ -36,7 +36,8 @@ def main():
 
     model = AutoModel.from_pretrained(MODEL, dtype=torch.float32, attn_implementation="sdpa").eval()
     loads = {k: v for k, v in workloads(model.config.vocab_size).items() if k in a.only.split(",")}
-    pe.pack(model, engine=pe.ModernBertCPU(threads=a.threads))
+    pe.pack(model, engine=pe.ModernBertCPU(threads=a.threads),
+            attention_backend="auto" if a.mode == "auto" else "native")
     engine = pe.get_engine(model)
     att = engine.attention
     if a.mode == "sdpa_attn":
@@ -69,7 +70,8 @@ def main():
             dumps[name] = out.clone()
             print(f"[{a.tag:10s} t{a.threads:<2d}] {name:18s} {ms:9.2f} ms | "
                   + " ".join(f"{k}={v:.1f}" for k, v in sorted(per.items(), key=lambda kv: -kv[1])), flush=True)
-    json.dump({"tag": a.tag, "threads": a.threads, "mode": a.mode, "rows": rows},
+    json.dump({"tag": a.tag, "threads": a.threads, "mode": a.mode, "rows": rows,
+               "attention_tuning": {str(k): v for k, v in att.attention_tuning.items()}},
               open(a.out, "w"), indent=1)
     if a.dump:
         torch.save(dumps, a.dump)

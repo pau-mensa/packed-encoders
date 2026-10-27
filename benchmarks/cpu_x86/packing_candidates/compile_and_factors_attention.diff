@@ -1,0 +1,17 @@
+--- a/packed_encoders/cpu/attention.py
++++ b/packed_encoders/cpu/attention.py
+@@ -90,9 +90,13 @@
+     sources = (("rows.c", "-ffp-contract=off"), ("local_attention_x86.c", "-ffp-contract=fast"),
+                ("gemm_x86.c", "-ffp-contract=fast"))
+     try:
+-        for name, contract in sources:
++        from concurrent.futures import ThreadPoolExecutor
++        def compile_source(source):
++            name, contract = source
+             subprocess.run([*compile_, contract, str(here / name), "-o", str(out / f"{name}.o")],
+                            check=True, capture_output=True, timeout=60)
++        with ThreadPoolExecutor(3) as pool:
++            list(pool.map(compile_source, sources))
+         subprocess.run([compiler, "-shared", *(str(out / f"{name}.o") for name, _ in sources), runtime,
+                         f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(out / "native.so")],
+                        check=True, capture_output=True, timeout=60)

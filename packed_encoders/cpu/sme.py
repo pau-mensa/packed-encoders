@@ -6,10 +6,10 @@ from functools import lru_cache
 from pathlib import Path
 import platform
 import subprocess
-import tempfile
 
 import torch
 
+from packed_encoders.cpu.build import shared_library
 from packed_encoders.errors import PackedEncodersError
 
 
@@ -27,23 +27,23 @@ def sme2_available():
 
 @lru_cache(maxsize=1)
 def library():
-    directory = tempfile.TemporaryDirectory(prefix="packed-encoders-fp32-sme-")
-    output = Path(directory.name) / "fp32.dylib"
+    directory = None
     try:
-        subprocess.run(
+        output, directory = shared_library("fp32.dylib", [
             # Every SME2 Mac runs macOS 15 or later; pool.h wakes with os_sync_wake_by_address_all (14.4).
             ["xcrun", "clang", "-O3", "-march=armv8-a+sme2", "-mmacosx-version-min=15.0", "-Wall", "-Wextra",
-             "-Werror", "-dynamiclib", str(Path(__file__).with_name("fp32_sme.c")), "-o", str(output)],
-            check=True, capture_output=True, timeout=60,
-        )
+             "-Werror", "-dynamiclib", str(Path(__file__).with_name("fp32_sme.c")), "-o", "{build}/fp32.dylib"],
+        ])
         lib = ctypes.CDLL(str(output))
     except (OSError, subprocess.SubprocessError) as exc:
-        directory.cleanup()
+        if directory is not None:
+            directory.cleanup()
         raise PackedEncodersError("FP32 SME GEMM unavailable; using Accelerate "
                                   "(needs Xcode Command Line Tools with SME2 support)") from exc
     lib.pe_sme_fp32_available.argtypes, lib.pe_sme_fp32_available.restype = [], ctypes.c_int
     if not lib.pe_sme_fp32_available():
-        directory.cleanup()
+        if directory is not None:
+            directory.cleanup()
         raise PackedEncodersError("FP32 SME needs 512-bit streaming vectors; using Accelerate")
     lib.pe_sme_fp32_linear.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_size_t]
     lib.pe_sme_fp32_linear.restype = ctypes.c_int

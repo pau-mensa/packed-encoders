@@ -83,7 +83,8 @@ class CPUAdapter:
 class ModernBertCPU:
     """CPU configuration. Thread count controls the native kernels' workers
     (attention, row kernels, native FP32 projections and int8 projections); it
-    defaults to PyTorch's thread count at packing.
+    defaults to PyTorch's thread count at packing, capped to the current Linux
+    CPU affinity mask and to its physical cores when topology is available.
 
     Other matrix operations (unprepared Apple FP32 projections, SDPA) use PyTorch/Accelerate's
     existing thread settings. This engine never changes process-global threading
@@ -208,7 +209,9 @@ class PackedModernBertCPU(EpilogueSupport):
         with ThreadPoolExecutor(1) as pool:
             if projection_library is not None:
                 pool.submit(projection_library)
-            self.attention = CPUAttention(backend, self.dim, self.half, engine.threads or torch.get_num_threads())
+            from packed_encoders.cpu.topology import default_threads
+            self.attention = CPUAttention(backend, self.dim, self.half, engine.threads or default_threads())
+        self.attention.tune_attention(self.heads, self.max_position, self.max_tokens)
         if engine.rehome_weights:  # before the plan takes its aliases
             rehome([param for layer in self.layers
                     for projection in (layer.attn.Wqkv, layer.attn.Wo, layer.mlp.Wi, layer.mlp.Wo)

@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from functools import lru_cache
-import os
 from pathlib import Path
 import platform
 import shutil
+import statistics
 import subprocess
-import tempfile
+import time
 import warnings
 import weakref
 
@@ -19,28 +18,27 @@ from torch import nn
 import torch.nn.functional as F
 
 from packed_encoders.errors import PackedEncodersError
+from packed_encoders.cpu.build import shared_library
 from packed_encoders.cpu.gemm import choose_tile, l1_data_cache_bytes, tune_tiles
 
 
 @lru_cache(maxsize=1)
 def _library():
-    # Process-private directory: no shared writable executable cache, stale ABI,
-    # or concurrent compiler races. Keep the directory alive with the library.
-    directory = tempfile.TemporaryDirectory(prefix="packed-encoders-cpu-")
-    path, here = Path(directory.name) / "attention.dylib", Path(__file__).parent
+    here = Path(__file__).parent
+    directory = None
     try:
-        subprocess.run(
-            ["xcrun", "clang", "-O3", "-Wall", "-Wextra", "-Werror", "-dynamiclib", "-framework", "Accelerate",
-             str(here / "local_attention.c"), str(here / "pool.c"), "-o", str(path)],
-            check=True, capture_output=True, timeout=30,
-        )
+        path, directory = shared_library("attention.dylib", [[
+            "xcrun", "clang", "-O3", "-Wall", "-Wextra", "-Werror", "-dynamiclib", "-framework", "Accelerate",
+            str(here / "local_attention.c"), str(here / "pool.c"), "-o", "{build}/attention.dylib",
+        ]])
         library = _signatures(ctypes.CDLL(str(path)))
         library.pe_pool.argtypes, library.pe_pool.restype = [ctypes.c_int] * 3, ctypes.c_void_p
         library.pe_pool_free.argtypes, library.pe_pool_free.restype = [ctypes.c_void_p], None
         library.pe_pool_threads.argtypes, library.pe_pool_threads.restype = [], ctypes.c_int
         return library, directory
     except (OSError, subprocess.SubprocessError) as exc:
-        directory.cleanup()
+        if directory is not None:
+            directory.cleanup()
         raise PackedEncodersError("Apple CPU attention needs the Xcode Command Line Tools (xcrun clang)") from exc
 
 
@@ -76,40 +74,23 @@ def _openmp_runtime():
 
 @lru_cache(maxsize=1)
 def _x86_library():
-    # Process-private, as for the Apple library. GCC compiles the OpenMP pragmas (clang only targets
-    # LLVM's runtime); linking PyTorch's loaded runtime instead of -fopenmp's -lgomp keeps one pool.
-    # Row kernels never contract (RoPE stays bitwise PyTorch's); attention and the projection GEMM
-    # accumulate with FMAs.
-    # The static vector helpers stay within their translation units; their AVX2 psABI warning
-    # is harmless and must not turn into a build failure under -Werror.
+    # Link the OpenMP runtime PyTorch already loaded, keeping one worker pool.
     runtime, compiler = _openmp_runtime(), shutil.which("gcc")
     if runtime is None or compiler is None:
         raise PackedEncodersError("native x86 CPU kernels need gcc and PyTorch's OpenMP runtime")
-    directory = tempfile.TemporaryDirectory(prefix="packed-encoders-x86-")
-    here, out = Path(__file__).parent, Path(directory.name)
+    here = Path(__file__).parent
     compile_ = [compiler, "-O3", "-march=native", "-fPIC", "-fopenmp", "-fno-trapping-math", "-fno-math-errno",
                 "-Wall", "-Wextra", "-Werror", "-Wno-unknown-pragmas", "-Wno-psabi", "-c"]
     sources = (("rows.c", "-ffp-contract=off"), ("local_attention_x86.c", "-ffp-contract=fast"),
                ("gemm_x86.c", "-ffp-contract=fast"))
-
-    def compile_source(source):
-        name, contract = source
-        subprocess.run([*compile_, contract, str(here / name), "-o", str(out / f"{name}.o")],
-                       check=True, capture_output=True, timeout=60)
-
+    commands = [[*compile_, contract, str(here / name), "-o", "{build}/" + name + ".o"]
+                for name, contract in sources]
+    commands.append([compiler, "-shared", *("{build}/" + name + ".o" for name, _ in sources), runtime,
+                     f"-Wl,-rpath,{Path(runtime).parent}", "-o", "{build}/native.so"])
+    directory = None
     try:
-        workers = min(len(sources), len(os.sched_getaffinity(0)))
-    except (AttributeError, OSError):
-        workers = min(len(sources), os.cpu_count() or 1)
-    try:
-        # Independent objects can compile together. Join every compiler before linking or,
-        # on failure, removing the temporary directory another compiler may still be using.
-        with ThreadPoolExecutor(workers) as pool:
-            list(pool.map(compile_source, sources))
-        subprocess.run([compiler, "-shared", *(str(out / f"{name}.o") for name, _ in sources), runtime,
-                        f"-Wl,-rpath,{Path(runtime).parent}", "-o", str(out / "native.so")],
-                       check=True, capture_output=True, timeout=60)
-        library = _signatures(ctypes.CDLL(str(out / "native.so")))
+        path, directory = shared_library("native.so", commands, runtime=runtime, parallel=True)
+        library = _signatures(ctypes.CDLL(str(path)))
         if hasattr(library, "pe_linear"):
             library.pe_linear.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4
             library.pe_linear.restype = ctypes.c_int
@@ -117,7 +98,8 @@ def _x86_library():
             library.pe_linear_tile.restype = ctypes.c_int
         return library, directory
     except (OSError, subprocess.SubprocessError) as exc:
-        directory.cleanup()
+        if directory is not None:
+            directory.cleanup()
         raise PackedEncodersError("native x86 CPU kernels need gcc with OpenMP") from exc
 
 
@@ -163,6 +145,8 @@ class CPUAttention:
 
     def __init__(self, backend, head_dim, half_window, threads, tile=64):
         self.tile, self.half, self.threads = tile, half_window, threads
+        self.requested_backend = backend
+        self.attention_tuning = {}
         apple = platform.system() == "Darwin" and platform.machine() == "arm64"
         x86 = platform.system() == "Linux" and platform.machine() == "x86_64"
         native = (apple or x86) and head_dim == 64 and half_window == 64
@@ -225,12 +209,68 @@ class CPUAttention:
     def _pool_handle(self):
         return None if self.pool is None else self.pool.handle
 
-    def tune_linear(self, projections, max_tokens):
+    def tune_attention(self, heads, max_seqlen, max_tokens):
+        """Choose x86 attention at pack time, retaining native row/GEMM kernels.
+
+        Small, fixed shape buckets bound setup work and dispatch storage. Requests
+        only look up the nearest bucket; they never time kernels. Explicit backends
+        and the established Apple policy bypass this calibration.
+        """
+        if (self.requested_backend != "auto" or self.library is None
+                or platform.system() != "Linux" or platform.machine() != "x86_64"):
+            return
+        limit = min(max_seqlen, max_tokens)
+        rng = torch.Generator().manual_seed(173)
+        with torch.inference_mode():
+            for length in sorted({min(n, limit) for n in (32, 128, 512)}):
+                for count in sorted({1, min(8, max_tokens // length)}):
+                    lengths = (length,) * count
+                    boundaries = torch.tensor(lengths, dtype=torch.int32, device="cpu")
+                    q, k, v = [torch.randn(1, heads, length * count, 64, generator=rng,
+                                          dtype=torch.float32, device="cpu") for _ in range(3)]
+                    for local in (False, True):
+                        if not local and length > 128:
+                            continue
+                        half = self.half if local else length
+                        calls = {
+                            "native": lambda: self._native(q, k, v, lengths, boundaries, half, True),
+                            "sdpa": lambda: self._layout(self._sdpa(q, k, v, lengths, local=local), True),
+                        }
+                        samples = {name: [] for name in calls}
+                        for round_ in range(4):  # warm both, then alternate to limit order bias
+                            for name in calls if round_ % 2 == 0 else reversed(calls):
+                                start = time.perf_counter_ns()
+                                for _ in range(3):
+                                    calls[name]()
+                                if round_:
+                                    samples[name].append((time.perf_counter_ns() - start) / 3e6)
+                        medians = {name: statistics.median(values) for name, values in samples.items()}
+                        selected = "native" if medians["native"] < .95 * medians["sdpa"] else "sdpa"
+                        self.attention_tuning[local, length, count] = {
+                            "selected": selected, "median_ms": medians,
+                        }
+        self.backend = "auto"
+
+    def _use_native(self, local, lengths):
+        if not self.attention_tuning:
+            return True
+        # Relative distance keeps short/long and single/batched calibration points
+        # distinct, without adding a cache entry for each ragged request shape.
+        longest, count = max(lengths), len(lengths)
+        candidates = (key for key in self.attention_tuning if key[0] == local)
+        key = min(candidates, key=lambda key: (max(longest / key[1], key[1] / longest)
+                                               * max(count / key[2], key[2] / count)))
+        return self.attention_tuning[key]["selected"] == "native"
+
+    def tune_linear(self, projections, max_tokens, *, shared=True):
         if self.native_linear:
             choices, report = tune_tiles(self.rows.pe_linear_tile, projections, self.threads,
                                          self.linear_l1_bytes, max_tokens)
-            self.linear_tiles.update(choices)
-            self.linear_tuning = report
+            if shared:
+                self.linear_tiles.update(choices)
+                self.linear_tuning.update(report)
+            return choices
+        return {}
 
     def rope_layout(self, qkv, cos, sin, heads, dim):
         """Internal FP32 conversion; native results borrow engine-owned storage.
@@ -257,7 +297,7 @@ class CPUAttention:
             return t * cos + torch.cat((-b, a), -1) * sin
         return rotate(q), rotate(k), v
 
-    def linear(self, x, weight, bias=None):
+    def linear(self, x, weight, bias=None, *, tiles=None, owned=False):
         """FP32 x @ weight.T + bias; native results borrow engine-owned storage.
 
         Weight [N, K] and bias are contiguous FP32 (the engine's parameter aliases). Activations
@@ -269,24 +309,27 @@ class CPUAttention:
         if self.sme is not None:
             out = self.sme.linear(x, weight, bias, self.threads)
             if out is not None:
-                return out
+                return out.clone() if owned else out
         n, k = weight.shape
         if not self.native_linear or x.dtype != torch.float32 or x.shape[-1] != k or not x.is_contiguous():
             return F.linear(x, weight, bias)
         shape = (*x.shape[:-1], n)
-        out = self.linear_buffers.get(n)
+        out = None if owned else self.linear_buffers.get(n)
         if out is None or out.shape != shape:
-            out = self.linear_buffers[n] = torch.empty(shape, dtype=torch.float32)
+            out = torch.empty(shape, dtype=torch.float32)
+            if not owned:
+                self.linear_buffers[n] = out
         m = x.numel() // k
         key = (m, n, k)
-        tile = self.linear_tiles.get(key)
+        tiles = self.linear_tiles if tiles is None else tiles
+        tile = tiles.get(key)
         if tile is None:
             # Residency is unchanged once M fills the largest (4-row) tile.
             # Bound the cache across varying request lengths; exact keys hold tuned choices.
             key = (min(m, 4), n, k)
-            tile = self.linear_tiles.get(key)
+            tile = tiles.get(key)
             if tile is None:
-                tile = self.linear_tiles[key] = choose_tile(m, k, self.linear_l1_bytes)
+                tile = tiles[key] = choose_tile(m, k, self.linear_l1_bytes)
         status = self.rows.pe_linear_tile(x.data_ptr(), weight.data_ptr(), None if bias is None else bias.data_ptr(),
                                           out.data_ptr(), m, n, k, self.threads, *tile)
         if status:
@@ -344,12 +387,12 @@ class CPUAttention:
 
     def local(self, q, k, v, lengths, boundaries, *, token_major=False):
         """Context as head-major [1, heads, tokens, dim], or [1, tokens, heads * dim] if token_major."""
-        if not self.native_local:
+        if not self.native_local or not self._use_native(True, lengths):
             return self._layout(self._sdpa(q, k, v, lengths, local=True), token_major)
         return self._native(q, k, v, lengths, boundaries, self.half, token_major)
 
     def global_(self, q, k, v, lengths, boundaries, *, token_major=False):
-        if self.native_global and max(lengths) <= 128:
+        if self.native_global and max(lengths) <= 128 and self._use_native(False, lengths):
             return self._native(q, k, v, lengths, boundaries, max(lengths), token_major)
         return self._layout(self._sdpa(q, k, v, lengths, local=False), token_major)
 
@@ -419,3 +462,4 @@ class CPUAttention:
         self.linear_buffers = {}
         self.linear_tiles.clear()
         self.linear_tuning.clear()
+        self.attention_tuning.clear()

@@ -53,6 +53,11 @@ class _CUDALinear(PreparedLinear):
         flat = x.reshape(-1, x.shape[-1]).contiguous()
         return self._linear(flat, self._weight).reshape(*x.shape[:-1], self._weight.shape[0])
 
+    def _execute_owned(self, x):
+        output = self._execute(x)
+        # cuBLAS through F.linear allocates its result. Pieces may return scratch.
+        return output if self._linear is None else output.clone()
+
     def _close(self):
         super()._close()
         self._linear = None

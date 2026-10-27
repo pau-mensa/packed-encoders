@@ -32,6 +32,7 @@ def test_hardware_gate_checks_capability_instead_of_chip_name(monkeypatch):
 
 
 def test_unsupported_streaming_width_reports_accelerate_fallback(monkeypatch):
+    monkeypatch.setenv('PACKED_ENCODERS_CPU_CACHE_DIR', '')
     lib = SimpleNamespace(pe_sme_fp32_available=lambda: 0)
     monkeypatch.setattr(sme.subprocess, "run", lambda *a, **kw: None)
     monkeypatch.setattr(sme.ctypes, "CDLL", lambda _: lib)

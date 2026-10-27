@@ -94,6 +94,7 @@ def main():
     att = engine.attention
     res["engine"] = {"backend": att.backend, "native_linear": att.native_linear, "fused_rope": att.fused_rope,
                      "native_local": att.native_local, "native_global": att.native_global,
+                     "attention_tuning": {str(k): v for k, v in att.attention_tuning.items()},
                      "report": repr(engine.state.validation_report)}
     print("engine", res["engine"], f"pack {res['pack_s']:.1f}s", flush=True)
 
