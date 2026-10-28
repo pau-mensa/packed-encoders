@@ -1,13 +1,0 @@
-Loading weights:   0%|          | 0/134 [00:00<?, ?it/s]Loading weights: 100%|██████████| 134/134 [00:00<00:00, 42913.40it/s]
-[1mModernBertModel LOAD REPORT[0m from: answerdotai/ModernBERT-base
-Key               | Status     |  | 
-------------------+------------+--+-
-head.dense.weight | UNEXPECTED |  | 
-head.norm.weight  | UNEXPECTED |  | 
-decoder.bias      | UNEXPECTED |  | 
-
-[3mNotes:
-- UNEXPECTED[3m	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.[0m
-24 real-text paragraphs, 3383 tokens, lengths 29-502
-fp32  token cos median 1.00000 p5 1.0000 min 1.0000 relL2 3.94e-06 | mean-pool cos min 1.00000 median 1.00000 | pack gate: median cos 1.00000, relL2 2.80e-06
-int8  token cos median 0.99957 p5 0.9992 min 0.1224 relL2 6.20e-02 | mean-pool cos min 0.99953 median 0.99984 | pack gate: median cos 0.99910, relL2 4.47e-02

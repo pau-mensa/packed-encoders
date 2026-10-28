@@ -122,7 +122,7 @@ On Linux x86-64, automatic CPU attention selection measures native attention and
 SDPA during packing, including on AVX2 CPUs. Default native workers respect the
 current Linux affinity mask, counting physical cores when topology is available;
 explicit `threads=` overrides this limit. See the
-[CPU review follow-up](benchmarks/cpu_review/README.md) for benchmark comparisons
+[CPU benchmark guide](benchmarks/cpu/README.md) for benchmark comparisons
 against HF SDPA, trimmed ONNX FP32 and MatMulNBits W8A8.
 
 ## ⚡️ Quick Start

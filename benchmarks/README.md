@@ -6,25 +6,15 @@ the lower-level attention benchmarks, and the remote launchers used to run them.
 Generated JSON results and downloaded datasets stay under the ignored
 `benchmarks/results/` and `benchmarks/data_cache/` directories.
 
-## Experimental CPU work
+## CPU benchmarks
 
-The installable CPU engine is documented in
-[`../docs/modernbert-cpu.md`](../docs/modernbert-cpu.md). The notes below are the
-research behind it.
+[`cpu/README.md`](cpu/README.md) documents the ModernBERT CPU performance,
+accuracy, packing-cache and native hardware checks. Comparisons use HF SDPA,
+trimmed ONNX FP32 and MatMulNBits W8A8. Generated results belong under the ignored
+`benchmarks/results/cpu/` directory.
 
-The initial M4 layer-probe and full-model research notes are not included in this
-checkout. The [SME2 guide](../docs/modernbert-cpu-sme.md) documents the current Apple
-projection path; the [review follow-up](cpu_review/README.md) contains the paired
-HF, trimmed ONNX and MatMulNBits W8A8 comparisons and reproduction commands.
-
-[`cpu_x86/README.md`](cpu_x86/README.md) covers the x86 port (Ryzen 9 9950X, Zen 5):
-native row and attention kernels, the native FP32 projection GEMM, AVX512-VNNI int8,
-and their measurements against ONNX Runtime FP32 and int8. The per-item notes and
-raw results live in the same directory.
-
-[`cpu_avx2/README.md`](cpu_avx2/README.md) measures the engine on an AVX2-only x86 CPU
-(i9-13900K) against stock HF and ONNX Runtime FP32, dynamic int8 and weight-only int8, with
-the scripts and raw JSON.
+The runtime itself is documented in [`../docs/modernbert-cpu.md`](../docs/modernbert-cpu.md)
+and the [SME2 guide](../docs/modernbert-cpu-sme.md).
 
 ## Published showcases
 

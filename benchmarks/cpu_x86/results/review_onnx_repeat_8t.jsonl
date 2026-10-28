@@ -1,3 +1,0 @@
-{"system": "onnx", "tag": "review_onnx_fp32", "threads": 8, "workload": "b1_s16_pad32", "live_tokens": 16, "padded_tokens": 32, "rows_per_run": 1, "n": 60, "median_ms": 11.16, "min_ms": 11.03, "max_ms": 12.46, "peak_rss_mb": 992}
-{"system": "onnx", "tag": "review_onnx_fp32", "threads": 8, "workload": "b1_s32", "live_tokens": 32, "padded_tokens": 32, "rows_per_run": 1, "n": 60, "median_ms": 11.16, "min_ms": 10.99, "max_ms": 11.84, "peak_rss_mb": 993}
-{"system": "onnx", "tag": "review_onnx_fp32", "threads": 8, "workload": "b8_s32", "live_tokens": 256, "padded_tokens": 256, "rows_per_run": 8, "n": 40, "median_ms": 37.34, "min_ms": 37.12, "max_ms": 37.81, "peak_rss_mb": 1025}

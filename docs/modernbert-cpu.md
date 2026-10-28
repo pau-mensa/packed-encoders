@@ -104,12 +104,12 @@ pe.pack(model, engine=pe.ModernBertCPU(threads=8, max_tokens=32768),
 - The native GEMM keeps one accumulation order per output, so results do not depend
   on batch composition, tile position or thread count. It reads the original weights
   in place: no reordered copy.
-- On AVX2-only CPUs, projections use `F.linear`. Joe's i9-13900K measurements found
-  native attention slower than SDPA at 1 and 8 threads, motivating automatic
-  pack-time attention selection. His [reproducible results](../benchmarks/cpu_avx2/README.md)
-  also show that oversubscribing native OpenMP teams can substantially slow short
-  requests. Set PyTorch's threads before packing; avoid exceeding the OS-reported
-  physical cores. `OMP_WAIT_POLICY=PASSIVE` alone does not recover the best latency.
+- On AVX2-only CPUs, projections use `F.linear`. Automatic attention selection
+  measures native attention against SDPA at packing. Oversubscribing native
+  OpenMP teams can substantially slow short requests. Set PyTorch's threads
+  before packing and avoid exceeding the OS-reported physical cores.
+  `OMP_WAIT_POLICY=PASSIVE` alone does not recover the best latency. The
+  [CPU benchmark guide](../benchmarks/cpu/README.md) includes a thread comparison.
 
 ## int8 precision
 
@@ -164,7 +164,8 @@ CCDs (one process each, 5 samples at 1,024 tokens and 2 at 8,192):
 | 32 × 8,192 tokens | 97.4 s | 50.6 s (−48%) |
 | 32 × up to 8,192 tokens (random lengths) | 37.1 s | 19.0 s (−49%) |
 
-Raw results and the harness are in [`benchmarks/cpu_x86/`](../benchmarks/cpu_x86/README.md).
+Historical measurements are recorded in [PR #15](https://github.com/pau-mensa/packed-encoders/pull/15).
+The current harness is documented in the [CPU benchmark guide](../benchmarks/cpu/README.md).
 
 These tables describe the historical M4/Zen 5 runs before automatic attention tuning.
 The ONNX int8 figures above use `quantize_dynamic`, not MatMulNBits W8A8. They are
@@ -172,7 +173,7 @@ not a comparison against the best available ORT int8 configuration. Large-batch
 comparisons should include HF SDPA and trim each ONNX row when running rows
 individually. On Joe's AVX2 system, full-row speedups were 1.18–1.59x against HF
 versus 2.87–8.08x against ONNX; trimming the random-length ONNX rows reduced that
-speedup from 5.26x to 2.07x. See [the complete tables](../benchmarks/cpu_avx2/results/summary.md).
+speedup from 5.26x to 2.07x. See [PR #15](https://github.com/pau-mensa/packed-encoders/pull/15) for the benchmark discussion.
 
 int8 is approximate. Against FP32 on the same inputs, relative L2 error is 3e-2 to
 8e-2, the median token cosine is about 0.9995 and the mean pooled cosine at least
@@ -242,9 +243,7 @@ Calls on one engine serialize access to its reusable scratch. Returned model out
 own their storage and survive subsequent calls. `pe.unpack()` releases the scratch
 and restores the original forward.
 
-See [the x86 port notes](../benchmarks/cpu_x86/README.md) for the historical Zen 5
-work and [Joe's AVX2 benchmarks](../benchmarks/cpu_avx2/README.md) for HF, trimmed
-ONNX and MatMulNBits comparisons. The [review follow-up](../benchmarks/cpu_review/README.md)
-tracks the resulting changes and remaining measurements. AVX-512, VNNI and SME2
-tests skip on runners without those instructions; portable CI alone does not
-validate those kernels.
+See the [CPU benchmark guide](../benchmarks/cpu/README.md) for paired HF,
+trimmed ONNX and MatMulNBits comparisons and native hardware checks. AVX-512,
+VNNI and SME2 tests skip on runners without those instructions; portable CI alone
+does not validate those kernels.
