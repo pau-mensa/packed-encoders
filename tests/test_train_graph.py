@@ -118,7 +118,7 @@ def _eager_dense_grads(encoder, params, weights, ids, mask, grad_seed):
 
 # Short S is bit-exact; a longer S sits in the bf16 band (a different SDPA
 # backward kernel is selected under capture than under eager .backward()).
-# validate.py's gate is cos 0.997, so cos > 0.999 here is comfortably inside it.
+# validate.py's gate is cos 0.98, so cos > 0.999 here is comfortably inside it.
 GRAD_COS = 0.999
 GRAD_RELL2 = 2e-2
 

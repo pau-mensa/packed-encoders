@@ -225,7 +225,7 @@ with two caller invariants: `optimizer.zero_grad(set_to_none=False)` (the backwa
 1. the model architecture (`config.model_type`, and with it the split-half RoPE convention the kernels assume);
 2. the compute capability against the validated matrix: sm_80, sm_89, sm_90, sm_100, sm_120;
 3. that the CuteDSL toolchain can JIT a kernel on this machine;
-4. that the fused forward tracks stock HF within the bf16 band (cosine ≥ 0.997 at S = 128/512/2048).
+4. that the fused forward tracks stock HF within the bf16 band (cosine ≥ 0.98 at S = 128/512/2048, set from what a broken fused path scores).
 
 The packed forward requires `input_ids`; `inputs_embeds`, attention/hidden-state outputs, and non-zero `token_type_ids` are not supported.
 

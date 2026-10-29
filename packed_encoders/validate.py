@@ -21,16 +21,23 @@ from packed_encoders.locate import find_encoder
 from packed_encoders.state import ATTR
 
 # Compute capabilities the fused-tail FORWARD is numerically validated on (sm_90/100/120
-# bit-identical; sm_80/sm_89 within the 0.997 band). This gate certifies only the
+# bit-identical; sm_80/sm_89 within the gate below). This gate certifies only the
 # forward — training on sm_8x is not yet probed.
 VALIDATED_CAPABILITIES = frozenset({(8, 0), (8, 9), (9, 0), (10, 0), (12, 0)})
 
 MIN_CUTLASS_DSL = (4, 5, 2)
 DEFAULT_SEQ_LENS = (128, 512, 2048)
-# A bf16 band, not an exactness check: stock HF's own SDPA and eager backends only
-# agree to ~0.998 at S>=512, and 0.997 sits just under that so a real divergence
-# (which lands far lower) is still caught.
-DEFAULT_COS_THRESHOLD = 0.997
+# A bf16 band, not an exactness check, set from what a broken fused path scores rather than
+# from how close a correct one happens to land on one device. The gate compares two bf16
+# paths on random ids, and stock HF is the noisier one: against an fp32 forward, over 30 draws
+# on ModernBERT-base (RTX 4090), the fused path reads 0.994 at worst and stock bf16 0.933.
+# So a correct engine reads 0.9951 here on ModernBERT-base and 0.9865 on gte-modernbert-base,
+# and the former 0.997 refused both on an RTX 4090 (it passes or fails with the torch build).
+# Breaking one piece at a time on the same draws (layer kinds, window, RoPE thetas, attention
+# scale, GeGLU halves, residual, norm eps) scores 0.958 at most on either checkpoint, so 0.98
+# keeps a margin of about 0.02 to a real error. Subtler errors (a window off by one, a 5%
+# attention scale) score inside bf16 noise and are left to the exact tests.
+DEFAULT_COS_THRESHOLD = 0.98
 
 
 @dataclass
