@@ -2369,7 +2369,7 @@ wheels = [
 
 [[package]]
 name = "packed-encoders"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and sys_platform == 'emscripten') or (python_full_version >= '3.11' and sys_platform == 'win32') or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-15-packed-encoders-embedding-gemma2' and extra == 'extra-15-packed-encoders-pylate') or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-15-packed-encoders-embedding-gemma2' and extra == 'extra-15-packed-encoders-qwen3-5') or (sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-15-packed-encoders-pylate' and extra == 'extra-15-packed-encoders-qwen3-5') or (sys_platform == 'emscripten' and extra == 'extra-15-packed-encoders-embedding-gemma2' and extra == 'extra-15-packed-encoders-pylate') or (sys_platform == 'emscripten' and extra == 'extra-15-packed-encoders-embedding-gemma2' and extra == 'extra-15-packed-encoders-qwen3-5') or (sys_platform == 'emscripten' and extra == 'extra-15-packed-encoders-pylate' and extra == 'extra-15-packed-encoders-qwen3-5') or (sys_platform == 'win32' and extra == 'extra-15-packed-encoders-embedding-gemma2' and extra == 'extra-15-packed-encoders-pylate') or (sys_platform == 'win32' and extra == 'extra-15-packed-encoders-embedding-gemma2' and extra == 'extra-15-packed-encoders-qwen3-5') or (sys_platform == 'win32' and extra == 'extra-15-packed-encoders-pylate' and extra == 'extra-15-packed-encoders-qwen3-5')" },
