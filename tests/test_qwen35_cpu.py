@@ -38,6 +38,75 @@ def inputs(lengths=(7, 65)):
     return ids, mask
 
 
+@pytest.mark.parametrize("hd,rot", [(7, 4), (16, 16), (256, 64)])
+@torch.no_grad()
+def test_native_qk_norm_rope(model, hd, rot):
+    from types import SimpleNamespace
+    from packed_encoders.cpu.qwen35 import GatedDeltaNet
+    norm_type = type(model.norm)
+    a = SimpleNamespace(head_dim=hd, q_norm=norm_type(hd, eps=1e-5), k_norm=norm_type(hd, eps=1e-4))
+    a.q_norm.weight.copy_(torch.randn(hd))
+    a.k_norm.weight.copy_(torch.randn(hd))
+    nq, nk = 3, 1
+    native = GatedDeltaNet(2)
+    def rope(t, cos, sin):
+        prefix = t[..., :rot]
+        turn = torch.cat((-prefix[..., rot // 2:], prefix[..., :rot // 2]), -1)
+        return torch.cat((prefix * cos[:, None] + turn * sin[:, None], t[..., rot:]), -1)
+    try:
+        for rows in (1, 7, 3):
+            p = torch.randn(rows, 2 * (nq + nk) * hd + 5)
+            before = p.clone()
+            # Distinct entries in both halves also exercise scaled/custom tables.
+            cos, sin = torch.randn(rows, rot), torch.randn(rows, rot)
+            q = a.q_norm(p[:, :2 * nq * hd].reshape(rows, nq, 2 * hd)[..., :hd])
+            k = a.k_norm(p[:, 2 * nq * hd:(2 * nq + nk) * hd].reshape(rows, nk, hd))
+            got_q, got_k = native.qk_rope(p, a, cos, sin, nq, nk)
+            torch.testing.assert_close(got_q, rope(q, cos, sin), atol=3e-6, rtol=3e-6)
+            torch.testing.assert_close(got_k, rope(k, cos, sin), atol=3e-6, rtol=3e-6)
+            torch.testing.assert_close(p, before, atol=0, rtol=0)
+            a.q_norm.weight.add_(.25)
+            a.k_norm.weight.sub_(.25)
+    finally:
+        native.close()
+    assert native.q_buffer is native.k_buffer is None
+
+
+@torch.no_grad()
+def test_qk_norm_rope_fallbacks(model, monkeypatch):
+    pe.pack(model, engine=pe.Qwen35CPU(threads=1), attention_backend="native", validate=False)
+    engine = pe.get_engine(model)
+    attention = engine.layers[1].mixer
+    p = torch.randn(3, engine.layers[1].mixed.shape[0])
+    cos, sin = torch.randn(3, 32)[:, ::2], torch.randn(3, 32)[:, ::2]
+    try:
+        want = engine._qk_rope(p, attention, cos.contiguous(), sin.contiguous())
+        want = tuple(t.clone() for t in want)
+        def unexpected(*args, **kwargs):
+            raise AssertionError("unsupported input reached fused Q/K norm/RoPE")
+        monkeypatch.setattr(engine.native, "qk_rope", unexpected)
+        got = engine._qk_rope(p, attention, cos, sin)
+        for actual, expected in zip(got, want):
+            torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-6)
+        # Large packed batches retain the eager path even with contiguous tables.
+        large = p[:1].expand(129, -1).contiguous()
+        large_cos = cos[:1].expand(129, -1).contiguous()
+        large_sin = sin[:1].expand(129, -1).contiguous()
+        got = engine._qk_rope(large, attention, large_cos, large_sin)
+        for actual, expected in zip(got, want):
+            torch.testing.assert_close(actual, expected[:1].expand_as(actual), atol=3e-6, rtol=3e-6)
+        calls = []
+        original = attention.q_norm.forward
+        def custom(x):
+            calls.append(True)
+            return original(x)
+        monkeypatch.setattr(attention.q_norm, "forward", custom)
+        engine._qk_rope(p, attention, cos.contiguous(), sin.contiguous())
+        assert calls == [True]
+    finally:
+        pe.unpack(model)
+
+
 @pytest.mark.parametrize("width,padding", [(1, 0), (15, 34), (128, 0), (3584, 0)])
 @pytest.mark.parametrize("threads", [1, 3])
 @torch.no_grad()

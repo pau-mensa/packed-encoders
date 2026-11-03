@@ -99,6 +99,51 @@ int pe_qwen35_add_norm(float *residual, const float *branch, const float *weight
     return 0;
 }
 
+// Normalize each full head, then rotate only its configured prefix. The two
+// RoPE halves use their own cos/sin entries (including scaled/custom tables).
+static void qk_norm_rope(const float *x, const float *weight, const float *cos,
+                         const float *sin, float *out, int hd, int rot, float eps) {
+    float sum = 0.f;
+    int d = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    float32x4_t sums = vdupq_n_f32(0.f);
+    for (; d + 4 <= hd; d += 4) {
+        float32x4_t v = vld1q_f32(x + d);
+        sums = vaddq_f32(sums, vmulq_f32(v, v));
+    }
+    sum = vaddvq_f32(sums);
+#endif
+    for (; d < hd; ++d) sum += x[d] * x[d];
+    float inv = 1.f / sqrtf(sum / hd + eps);
+    int half = rot / 2;
+    for (d = 0; d < half; ++d) {
+        float lo = x[d] * inv * (1.f + weight[d]);
+        float hi = x[d + half] * inv * (1.f + weight[d + half]);
+        out[d] = lo * cos[d] + (-hi) * sin[d];
+        out[d + half] = hi * cos[d + half] + lo * sin[d + half];
+    }
+    for (d = rot; d < hd; ++d) out[d] = x[d] * inv * (1.f + weight[d]);
+}
+
+int pe_qwen35_qk_rope(const float *p, const float *wq, const float *wk,
+                      const float *cos, const float *sin, float *q, float *k,
+                      int rows, int nq, int nk, int hd, int rot, int stride,
+                      float qeps, float keps) {
+    if (rows <= 0 || nq <= 0 || nk <= 0 || hd <= 0 || rot < 0 || rot > hd || rot % 2 ||
+        stride < 2 * (nq + nk) * hd) return 1;
+    for (int row = 0; row < rows; ++row) {
+        const float *src = p + (size_t)row * stride;
+        const float *c = cos + (size_t)row * rot, *s = sin + (size_t)row * rot;
+        for (int head = 0; head < nq; ++head)
+            qk_norm_rope(src + head * 2 * hd, wq, c, s,
+                         q + ((size_t)row * nq + head) * hd, hd, rot, qeps);
+        for (int head = 0; head < nk; ++head)
+            qk_norm_rope(src + (2 * nq + head) * hd, wk, c, s,
+                         k + ((size_t)row * nk + head) * hd, hd, rot, keps);
+    }
+    return 0;
+}
+
 static float convolve(const QwenJob *j, int token, int begin, int channel) {
     float x = j->bias ? j->bias[channel] : 0.f;
     for (int tap = 0; tap < j->width; ++tap) {

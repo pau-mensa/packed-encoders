@@ -267,22 +267,33 @@ class PackedQwen35CPU(EpilogueSupport):
         out = None if self.sme is None else self.sme.linear(x.contiguous(), p.weight, None, self.threads)
         return F.linear(x, p.weight) if out is None else out
 
-    def _attention(self, x, layer, lengths, cos, sin):
-        a = layer.mixer
-        n, nq, nk, hd = x.shape[0], self.cfg.num_attention_heads, self.cfg.num_key_value_heads, a.head_dim
-        p = self._linear(x, layer.mixed)
-        qw, kw = nq * 2 * hd, nk * hd
-        q, gate = p[:, :qw].reshape(n, nq, 2 * hd).chunk(2, -1)
-        q = a.q_norm(q)
-        k = a.k_norm(p[:, qw:qw + kw].reshape(n, nk, hd))
-        # Own V and gate before a later same-width projection reuses SME's output buffer.
-        v = p[:, qw + kw:qw + 2 * kw].reshape(n, nk, hd)
+    def _qk_rope(self, p, attention, cos, sin):
+        nq, nk, hd = self.cfg.num_attention_heads, self.cfg.num_key_value_heads, attention.head_dim
+        # M4 full-model probes favor fusion at 32/128 packed tokens, but regress
+        # at 256 despite a faster isolated kernel. Keep larger batches on Torch.
+        if (p.shape[0] <= 128 and self.native is not None
+                and p.is_contiguous() and cos.is_contiguous() and sin.is_contiguous()
+                and all(type(norm) is self._rms_norm_type and "forward" not in norm.__dict__
+                        for norm in (attention.q_norm, attention.k_norm))):
+            return self.native.qk_rope(p, attention, cos, sin, nq, nk)
+        n, qw, kw = p.shape[0], 2 * nq * hd, nk * hd
+        q = attention.q_norm(p[:, :qw].reshape(n, nq, 2 * hd)[..., :hd])
+        k = attention.k_norm(p[:, qw:qw + kw].reshape(n, nk, hd))
         r = cos.shape[-1]
         def rope(t):
             rot = t[..., :r]
             rotated = torch.cat((-rot[..., r // 2:], rot[..., :r // 2]), -1)
             return torch.cat((rot * cos[:, None] + rotated * sin[:, None], t[..., r:]), -1)
-        q, k = rope(q), rope(k)
+        return rope(q), rope(k)
+
+    def _attention(self, x, layer, lengths, cos, sin):
+        a = layer.mixer
+        n, nq, nk, hd = x.shape[0], self.cfg.num_attention_heads, self.cfg.num_key_value_heads, a.head_dim
+        p = self._linear(x, layer.mixed)
+        qw, kw = nq * 2 * hd, nk * hd
+        gate = p[:, :qw].reshape(n, nq, 2 * hd)[..., hd:]
+        v = p[:, qw + kw:qw + 2 * kw].reshape(n, nk, hd)
+        q, k = self._qk_rope(p, a, cos, sin)
         if all(length == lengths[0] for length in lengths):
             # Keep sequence boundaries in the batch dimension and launch SDPA once.
             batch, length = len(lengths), lengths[0]

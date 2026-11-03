@@ -40,6 +40,8 @@ def library():
     lib.pe_qwen35_add_norm.restype = ctypes.c_int
     lib.pe_qwen35_swiglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
     lib.pe_qwen35_swiglu.restype = ctypes.c_int
+    lib.pe_qwen35_qk_rope.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 6 + [ctypes.c_float] * 2
+    lib.pe_qwen35_qk_rope.restype = ctypes.c_int
     if apple:
         lib.pe_pool.argtypes, lib.pe_pool.restype = [ctypes.c_int] * 3, ctypes.c_void_p
         lib.pe_pool_free.argtypes, lib.pe_pool_free.restype = [ctypes.c_void_p], None
@@ -53,6 +55,22 @@ class GatedDeltaNet:
         self.threads = min(threads, 16)
         self.pool = WorkerPool(self.library, self.threads) if platform.system() == "Darwin" and threads > 1 else None
         self.scratch = self.norm_buffer = self.swiglu_buffer = None
+        self.q_buffer = self.k_buffer = None
+
+    def qk_rope(self, p, attention, cos, sin, nq, nk):
+        """Borrowed token-major normalized/rotated Q and K; projection stays intact."""
+        n, hd = p.shape[0], attention.head_dim
+        if self.q_buffer is None or self.q_buffer.shape != (n, nq, hd):
+            self.q_buffer = torch.empty(n, nq, hd, dtype=torch.float32)
+        if self.k_buffer is None or self.k_buffer.shape != (n, nk, hd):
+            self.k_buffer = torch.empty(n, nk, hd, dtype=torch.float32)
+        status = self.library.pe_qwen35_qk_rope(
+            p.data_ptr(), attention.q_norm.weight.data_ptr(), attention.k_norm.weight.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(), self.q_buffer.data_ptr(), self.k_buffer.data_ptr(),
+            n, nq, nk, hd, cos.shape[-1], p.stride(0), attention.q_norm.eps, attention.k_norm.eps)
+        if status:
+            raise PackedEncodersError(f"native Qwen3.5 Q/K norm/RoPE failed: {status}")
+        return self.q_buffer, self.k_buffer
 
     def swiglu(self, x, width):
         """Return contiguous borrowed SiLU(gate) * up from a merged projection."""
@@ -102,6 +120,7 @@ class GatedDeltaNet:
             self.pool.close()
             self.pool = None
         self.scratch = self.norm_buffer = self.swiglu_buffer = None
+        self.q_buffer = self.k_buffer = None
 
 
 def reference_gdn(projection, layer, lengths):
