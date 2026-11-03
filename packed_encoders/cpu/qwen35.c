@@ -26,6 +26,41 @@ typedef struct {
 static float sigmoid(float x) { return 1.f / (1.f + expf(-x)); }
 static float softplus(float x) { return x > 20.f ? x : log1pf(expf(x)); }
 
+// Projection rows are [gate | up | optional alignment padding].
+typedef struct {
+    const float *in;
+    float *out;
+    int rows, width, stride;
+    _Atomic int next;
+} SwigluJob;
+
+static void swiglu_worker(void *opaque, size_t worker) {
+    (void)worker;
+    SwigluJob *j = opaque;
+    int row;
+    while ((row = atomic_fetch_add_explicit(&j->next, 1, memory_order_relaxed)) < j->rows) {
+        const float *gate = j->in + (size_t)row * j->stride, *up = gate + j->width;
+        float *out = j->out + (size_t)row * j->width;
+        for (int d = 0; d < j->width; ++d)
+            out[d] = (gate[d] / (1.f + expf(-gate[d]))) * up[d];
+    }
+}
+
+int pe_qwen35_swiglu(const float *in, float *out, int rows, int width, int stride,
+                     int workers, void *pool) {
+    if (rows <= 0 || width <= 0 || stride < 2 * width || workers <= 0) return 1;
+    if (workers > rows) workers = rows;
+    SwigluJob j = {.in=in, .out=out, .rows=rows, .width=width, .stride=stride, .next=0};
+#ifdef __APPLE__
+    pe_pool_apply(pool, workers, &j, swiglu_worker, 0);
+#else
+    (void)pool;
+    #pragma omp parallel num_threads(workers)
+    swiglu_worker(&j, (size_t)omp_get_thread_num());
+#endif
+    return 0;
+}
+
 // Qwen's zero-centered RMSNorm: normalize(residual + branch) * (1 + weight).
 // The residual is engine-owned; out must be separate storage. These row jobs are
 // small enough that one worker avoids pool wakeups and competition with BLAS.

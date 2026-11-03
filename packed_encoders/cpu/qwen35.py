@@ -38,6 +38,8 @@ def library():
     lib.pe_qwen35_gdn.restype = ctypes.c_int
     lib.pe_qwen35_add_norm.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 2 + [ctypes.c_float]
     lib.pe_qwen35_add_norm.restype = ctypes.c_int
+    lib.pe_qwen35_swiglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
+    lib.pe_qwen35_swiglu.restype = ctypes.c_int
     if apple:
         lib.pe_pool.argtypes, lib.pe_pool.restype = [ctypes.c_int] * 3, ctypes.c_void_p
         lib.pe_pool_free.argtypes, lib.pe_pool_free.restype = [ctypes.c_void_p], None
@@ -50,7 +52,19 @@ class GatedDeltaNet:
         self.library, self._directory = library()
         self.threads = min(threads, 16)
         self.pool = WorkerPool(self.library, self.threads) if platform.system() == "Darwin" and threads > 1 else None
-        self.scratch = self.norm_buffer = None
+        self.scratch = self.norm_buffer = self.swiglu_buffer = None
+
+    def swiglu(self, x, width):
+        """Return contiguous borrowed SiLU(gate) * up from a merged projection."""
+        shape = (x.shape[0], width)
+        if self.swiglu_buffer is None or self.swiglu_buffer.shape != shape:
+            self.swiglu_buffer = torch.empty(shape, dtype=torch.float32)
+        status = self.library.pe_qwen35_swiglu(
+            x.data_ptr(), self.swiglu_buffer.data_ptr(), x.shape[0], width, x.stride(0),
+            self.threads, None if self.pool is None else self.pool.handle)
+        if status:
+            raise PackedEncodersError(f"native Qwen3.5 SwiGLU failed: {status}")
+        return self.swiglu_buffer
 
     def add_norm(self, x, branch, norm, *, owned=False):
         """Update an owned residual and return normalized scratch (or owned output)."""
@@ -87,7 +101,7 @@ class GatedDeltaNet:
         if self.pool is not None:
             self.pool.close()
             self.pool = None
-        self.scratch = self.norm_buffer = None
+        self.scratch = self.norm_buffer = self.swiglu_buffer = None
 
 
 def reference_gdn(projection, layer, lengths):

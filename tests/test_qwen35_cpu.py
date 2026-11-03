@@ -38,6 +38,27 @@ def inputs(lengths=(7, 65)):
     return ids, mask
 
 
+@pytest.mark.parametrize("width,padding", [(1, 0), (15, 34), (128, 0), (3584, 0)])
+@pytest.mark.parametrize("threads", [1, 3])
+@torch.no_grad()
+def test_native_swiglu(width, padding, threads):
+    from packed_encoders.cpu.qwen35 import GatedDeltaNet
+    native = GatedDeltaNet(threads)
+    try:
+        for rows in (1, 7, 3):
+            x = torch.randn(rows, 2 * width + padding)
+            x[:, :width] *= 30  # Includes sigmoid saturation and exp overflow.
+            before = x.clone()
+            want = torch.nn.functional.silu(x[:, :width]) * x[:, width:2 * width]
+            got = native.swiglu(x, width)
+            assert got.is_contiguous()
+            torch.testing.assert_close(got, want, atol=2e-6, rtol=2e-6)
+            torch.testing.assert_close(x, before, atol=0, rtol=0)
+    finally:
+        native.close()
+    assert native.swiglu_buffer is None
+
+
 @pytest.mark.parametrize("width", [1, 3, 15, 64, 1024])
 @torch.no_grad()
 def test_native_add_rmsnorm(model, width):

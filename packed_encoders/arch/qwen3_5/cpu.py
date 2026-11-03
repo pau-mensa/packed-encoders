@@ -312,6 +312,11 @@ class PackedQwen35CPU(EpilogueSupport):
         x = x + branch
         return x, norm(x)
 
+    def _swiglu(self, x, width):
+        if self.native is not None and x.is_contiguous():
+            return self.native.swiglu(x, width)
+        return F.silu(x[:, :width]) * x[:, width:2 * width]
+
     def _core(self, ids, lengths, positions):
         if self.int8 is not None:
             self.int8.check_versions()
@@ -330,7 +335,7 @@ class PackedQwen35CPU(EpilogueSupport):
             x, h = self._add_norm(x, mix, layer.post)
             h = self._linear(h, layer.up)
             width = layer.up.sizes[0]
-            h = F.silu(h[:, :width]) * h[:, width:2 * width]
+            h = self._swiglu(h, width)
             final = i + 1 == len(self.layers)
             norm = self.model.norm if final else self.layers[i + 1].input
             x, h = self._add_norm(x, self._linear(h.contiguous(), layer.down)[:, :self.hidden], norm, owned=final)
