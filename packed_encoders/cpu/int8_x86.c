@@ -352,6 +352,28 @@ void pe_q8_quantize(const float *x, int M, int K, const float *signs, int block,
     for (int r = 0; r < M; ++r) emit_row(x + (size_t)r * K, K, signs, block, tmp, rows + (size_t)r * K, scale + r);
 }
 
+// General projection with the same per-row activation quantization and VNNI packing.
+int pe_q8_linear(const float *x, const int8_t *w, const float *ws, const int32_t *correction,
+                  const float *signs, float *out, uint8_t *a, float *scale, float *scratch,
+                  int32_t *products, int M, int N, int K, int block, int workers, void *pool) {
+    (void)pool;
+    if (M <= 0 || N <= 0 || N % 64 || K <= 0 || K % 64 || workers <= 0 ||
+        (block != 64 && block != 128) || K % block) return 1;
+    #pragma omp parallel num_threads(workers)
+    {
+        float *tmp = scratch + (size_t)omp_get_thread_num() * K;
+        #pragma omp for schedule(static)
+        for (int r = 0; r < M; ++r)
+            emit_row(x + (size_t)r * K, K, signs, block, tmp, a + (size_t)r * K, scale + r);
+        gemm(a, K, w, products, N, M);
+        #pragma omp for schedule(static)
+        for (int r = 0; r < M; ++r)
+            for (int n = 0; n < N; ++n)
+                out[(size_t)r * N + n] = (products[(size_t)r * N + n] - correction[n]) * (ws[n] * scale[r]);
+    }
+    return 0;
+}
+
 // Pack-time GPTQ: the column loop over columns [i1, i2) of a row-major [n][k] weight copy
 // (int8.py). Rows are independent; errors is [n][i2 - i1].
 int pe_q8_gptq_block(float *w, const float *hinv, const float *scale, int8_t *q, float *errors, int n, int k, int i1,

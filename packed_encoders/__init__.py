@@ -14,6 +14,8 @@ inherits the speedup with no adapter. Curated engines (`packed_encoders.arch`):
   extra HF outputs.
 - Qwen3.5 / topk-embed-v1: hybrid FLA/Triton pieces, graphs on by default,
   original-forward fallback for gradients and image inputs.
+- CPU Qwen3.5: packed native GatedDeltaNet, FP32 or opt-in SME2/VNNI INT8
+  projections, and grouped-query SDPA; original-forward fallback for caches and gradients.
 
     import packed_encoders as pe
     pe.pack(model)                   # architecture defaults
@@ -35,6 +37,7 @@ from packed_encoders.errors import (
 
 # Architecture-specific public names, loaded on first access.
 _LAZY = {
+    "Qwen35CPU": ("packed_encoders.arch.qwen3_5.cpu", "Qwen35CPU"),
     "ModernBertCPU": ("packed_encoders.arch.modernbert_cpu", "ModernBertCPU"),
     "PaddedGraphConfig": ("packed_encoders.runtime.graphs", "PaddedGraphConfig"),
     "Qwen35Report": ("packed_encoders.arch.qwen3_5", "Qwen35Report"),
@@ -78,6 +81,7 @@ _keep_public_functions()
 
 
 __all__ = [
+    "Qwen35CPU",
     "epilogues",
     "ModernBertCPU",
     "PaddedGraphConfig",

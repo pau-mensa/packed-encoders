@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "rows.h"
+#include "pool.h"
 
 typedef struct {
     int hidden, heads, width, block_hidden, block_width;
@@ -299,6 +300,54 @@ void pe_q8_quantize(const float *x, int M, int K, const float *signs, int block,
                     int8_t *packed, float *scale) {
     zero_padding(packed, M, K);
     for (int m = 0; m < M; ++m) emit_row(x + (size_t)m * K, K, signs, block, tmp, packed, scale, m);
+}
+
+// General packed projection, used by Qwen3.5. Quantize rows once, then distribute
+// independent 32x64 output tiles; short batches can use all workers along N.
+typedef struct {
+    const float *x, *ws, *signs;
+    const int8_t *w;
+    int8_t *a;
+    float *scale, *scratch, *out;
+    int32_t *products;
+    int m, n, k, block, phase;
+    _Atomic int next;
+} LinearJob;
+
+static void linear_worker(void *opaque, size_t worker) {
+    LinearJob *j = opaque;
+    int task, groups = (j->m + 31) / 32, tiles = j->n / 64;
+    if (!j->phase) {
+        while ((task = atomic_fetch_add_explicit(&j->next, 1, memory_order_relaxed)) < j->m)
+            emit_row(j->x + (size_t)task * j->k, j->k, j->signs, j->block,
+                     j->scratch + worker * j->k, j->a, j->scale, task);
+    } else {
+        int32_t *c = j->products + worker * 32 * 64;
+        while ((task = atomic_fetch_add_explicit(&j->next, 1, memory_order_relaxed)) < groups * tiles) {
+            int nb = task / groups, begin = task % groups * 32;
+            int rows = j->m - begin < 32 ? j->m - begin : 32;
+            gemm(j->a + (size_t)begin * j->k, j->w + (size_t)nb * 64 * j->k, c, rows, 64, j->k);
+            for (int r = 0; r < rows; ++r)
+                dequant_row(c + r * 64, j->scale[begin + r], j->ws + nb * 64,
+                            j->out + (size_t)(begin + r) * j->n + nb * 64, 64);
+        }
+    }
+}
+
+int pe_q8_linear(const float *x, const int8_t *w, const float *ws, const int32_t *correction,
+                  const float *signs, float *out, int8_t *a, float *scale, float *scratch,
+                  int32_t *products, int M, int N, int K, int block, int workers, void *pool) {
+    (void)correction;
+    if (M <= 0 || N <= 0 || N % 64 || K <= 0 || K % 64 || workers <= 0 ||
+        (block != 64 && block != 128) || K % block) return 1;
+    zero_padding(a, M, K);
+    LinearJob j = {.x=x, .w=w, .ws=ws, .signs=signs, .out=out, .a=a, .scale=scale,
+                   .scratch=scratch, .products=products, .m=M, .n=N, .k=K, .block=block, .phase=0, .next=0};
+    pe_pool_apply(pool, workers, &j, linear_worker, 0);
+    j.phase = 1;
+    atomic_store(&j.next, 0);
+    pe_pool_apply(pool, workers, &j, linear_worker, 0);
+    return 0;
 }
 
 // ---------------------------------------------------------------- pack-time GPTQ

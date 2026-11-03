@@ -297,6 +297,9 @@ class TopkEmbedAdapter:
         return ModelBinding(self, module, lm) if lm is not None else None
 
     def install(self, binding: ModelBinding, packed) -> None:
+        if next(binding.weight_source.parameters()).device.type == "cpu":
+            packed.install_forward()
+            return
         setattr(binding.patch_target, ATTR, packed.state)
         binding.patch_target.forward = _make_topk_forward(binding.patch_target, packed.state)
 
@@ -309,6 +312,9 @@ class HFQwen35Adapter:
         return ModelBinding(self, module, lm) if lm is not None else None
 
     def install(self, binding: ModelBinding, packed) -> None:
+        if next(binding.weight_source.parameters()).device.type == "cpu":
+            packed.install_forward()
+            return
         setattr(binding.patch_target, ATTR, packed.state)
         binding.patch_target.forward = _make_hf_forward(binding.patch_target, packed.state)
 
@@ -539,9 +545,19 @@ class Qwen35Hybrid:
                          stager=PinnedStager(engine.device))
 
     def validate(self, binding: ModelBinding, **kwargs) -> ValidationResult:
+        if next(binding.weight_source.parameters()).device.type == "cpu":
+            from packed_encoders.arch.qwen3_5.cpu import Qwen35CPU
+            if self.pieces is not None:
+                raise PackedEncodersError("CUDA operation pieces cannot be used by the CPU engine")
+            return Qwen35CPU().validate(binding, **kwargs)
         return ValidationResult(self.name, self._validate(binding.patch_target, causal=getattr(binding, "causal", None), **kwargs))
 
     def prepare(self, binding: ModelBinding, options):
+        if binding is not None and next(binding.weight_source.parameters()).device.type == "cpu":
+            from packed_encoders.arch.qwen3_5.cpu import Qwen35CPU
+            if self.pieces is not None:
+                raise PackedEncodersError("CUDA operation pieces cannot be used by the CPU engine")
+            return Qwen35CPU().prepare(binding, options)
         _check_options(options)
         module = binding.patch_target
         self._require_env(module)
