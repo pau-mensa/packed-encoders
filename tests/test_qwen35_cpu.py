@@ -38,6 +38,59 @@ def inputs(lengths=(7, 65)):
     return ids, mask
 
 
+@pytest.mark.parametrize("width", [1, 3, 15, 64, 1024])
+@torch.no_grad()
+def test_native_add_rmsnorm(model, width):
+    from packed_encoders.cpu.qwen35 import GatedDeltaNet
+    norm = type(model.norm)(width, eps=1e-5)
+    norm.weight.copy_(torch.randn(width))
+    native = GatedDeltaNet(2)
+    try:
+        x, branch = torch.randn(3, width), torch.randn(3, width)
+        branch_before = branch.clone()
+        residual = x + branch
+        want = norm(residual)
+        updated, out = native.add_norm(x, branch, norm, owned=True)
+        assert updated is x
+        torch.testing.assert_close(x, residual, atol=0, rtol=0)
+        torch.testing.assert_close(out, want, atol=2e-6, rtol=2e-6)
+        torch.testing.assert_close(branch, branch_before, atol=0, rtol=0)
+        saved = out.clone()
+        # Live norm updates and scratch reuse must not alter earlier owned outputs.
+        norm.weight.add_(.5)
+        for rows in (3, 1, 3):
+            x = torch.randn(rows, width)
+            b = branch[:rows]
+            want = norm(x + b)
+            _, scratch = native.add_norm(x, b, norm)
+            torch.testing.assert_close(scratch, want, atol=2e-6, rtol=2e-6)
+        torch.testing.assert_close(out, saved, atol=0, rtol=0)
+    finally:
+        native.close()
+    assert native.norm_buffer is None
+
+
+@torch.no_grad()
+def test_add_rmsnorm_fallbacks(model, monkeypatch):
+    pe.pack(model, engine=pe.Qwen35CPU(threads=1), attention_backend="native", validate=False)
+    engine = pe.get_engine(model)
+    def unexpected(*args, **kwargs):
+        raise AssertionError("unsupported input reached fused norm")
+    monkeypatch.setattr(engine.native, "add_norm", unexpected)
+    try:
+        x = torch.randn(3, 64)
+        branch = torch.randn(3, 128)[:, ::2]
+        want = model.norm(x + branch)
+        _, out = engine._add_norm(x, branch, model.norm)
+        torch.testing.assert_close(out, want)
+        branch = branch.contiguous()
+        monkeypatch.setattr(model.norm, "forward", lambda x: x * 2)
+        _, out = engine._add_norm(x, branch, model.norm)
+        torch.testing.assert_close(out, (x + branch) * 2)
+    finally:
+        pe.unpack(model)
+
+
 @pytest.mark.parametrize("lengths", [(1, 1), (7, 7, 7), (7, 3)])
 @pytest.mark.parametrize("causal", [True, False])
 @torch.no_grad()

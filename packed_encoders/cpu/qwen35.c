@@ -26,6 +26,44 @@ typedef struct {
 static float sigmoid(float x) { return 1.f / (1.f + expf(-x)); }
 static float softplus(float x) { return x > 20.f ? x : log1pf(expf(x)); }
 
+// Qwen's zero-centered RMSNorm: normalize(residual + branch) * (1 + weight).
+// The residual is engine-owned; out must be separate storage. These row jobs are
+// small enough that one worker avoids pool wakeups and competition with BLAS.
+int pe_qwen35_add_norm(float *residual, const float *branch, const float *weight,
+                      float *out, int rows, int width, float eps) {
+    if (rows <= 0 || width <= 0) return 1;
+    for (int row = 0; row < rows; ++row) {
+        float *x = residual + (size_t)row * width;
+        const float *b = branch + (size_t)row * width;
+        float *dst = out + (size_t)row * width;
+        float sum = 0.f;
+        int d = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        float32x4_t sums = vdupq_n_f32(0.f);
+        for (; d + 4 <= width; d += 4) {
+            float32x4_t v = vaddq_f32(vld1q_f32(x + d), vld1q_f32(b + d));
+            vst1q_f32(x + d, v);
+            sums = vaddq_f32(sums, vmulq_f32(v, v));
+        }
+        sum = vaddvq_f32(sums);
+#endif
+        for (; d < width; ++d) {
+            x[d] += b[d];
+            sum += x[d] * x[d];
+        }
+        float inv = 1.f / sqrtf(sum / width + eps);
+        d = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        for (; d + 4 <= width; d += 4) {
+            float32x4_t w = vaddq_f32(vdupq_n_f32(1.f), vld1q_f32(weight + d));
+            vst1q_f32(dst + d, vmulq_f32(vmulq_n_f32(vld1q_f32(x + d), inv), w));
+        }
+#endif
+        for (; d < width; ++d) dst[d] = x[d] * inv * (1.f + weight[d]);
+    }
+    return 0;
+}
+
 static float convolve(const QwenJob *j, int token, int begin, int channel) {
     float x = j->bias ? j->bias[channel] : 0.f;
     for (int tap = 0; tap < j->width; ++tap) {

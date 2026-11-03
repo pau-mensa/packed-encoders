@@ -139,6 +139,8 @@ class PackedQwen35CPU(EpilogueSupport):
     pieces = ()
 
     def __init__(self, binding, engine, options):
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+        self._rms_norm_type = Qwen3_5RMSNorm
         self.binding, self.model = binding, binding.weight_source
         self.original_forward = binding.patch_target.forward
         self.topk = _topk_text_model(binding.patch_target) is not None
@@ -303,6 +305,13 @@ class PackedQwen35CPU(EpilogueSupport):
         context = context * gate.reshape(n, nq * hd).sigmoid()
         return self._linear(context, layer.out)[:, :self.hidden]
 
+    def _add_norm(self, x, branch, norm, *, owned=False):
+        if (self.native is not None and type(norm) is self._rms_norm_type
+                and "forward" not in norm.__dict__ and x.is_contiguous() and branch.is_contiguous()):
+            return self.native.add_norm(x, branch, norm, owned=owned)
+        x = x + branch
+        return x, norm(x)
+
     def _core(self, ids, lengths, positions):
         if self.int8 is not None:
             self.int8.check_versions()
@@ -310,20 +319,22 @@ class PackedQwen35CPU(EpilogueSupport):
         cos, sin = self.model.rotary_emb(x[None], positions[None, None].expand(3, 1, -1))
         cos, sin = cos[0], sin[0]
         cu = torch.tensor((0, *lengths), dtype=torch.int32).cumsum(0, dtype=torch.int32)
-        for layer in self.layers:
-            h = layer.input(x)
+        h = self.layers[0].input(x)
+        for i, layer in enumerate(self.layers):
             if layer.linear:
                 projection = self._linear(h, layer.mixed)
                 h = (self.native(projection, layer, cu) if self.native else reference_gdn(projection, layer, lengths))
                 mix = self._linear(h, layer.out)[:, :self.hidden]
             else:
                 mix = self._attention(h, layer, lengths, cos, sin)
-            x = x + mix
-            h = self._linear(layer.post(x), layer.up)
+            x, h = self._add_norm(x, mix, layer.post)
+            h = self._linear(h, layer.up)
             width = layer.up.sizes[0]
             h = F.silu(h[:, :width]) * h[:, width:2 * width]
-            x = x + self._linear(h.contiguous(), layer.down)[:, :self.hidden]
-        return self.model.norm(x)
+            final = i + 1 == len(self.layers)
+            norm = self.model.norm if final else self.layers[i + 1].input
+            x, h = self._add_norm(x, self._linear(h.contiguous(), layer.down)[:, :self.hidden], norm, owned=final)
+        return h
 
     def _ids(self, ids):
         if ids.device.type != "cpu" or ids.dtype not in (torch.int64, torch.int32) or ids.numel() == 0:

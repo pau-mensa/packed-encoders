@@ -36,6 +36,8 @@ def library():
         raise PackedEncodersError("native Qwen3.5 CPU kernels need a C compiler (Xcode tools on macOS, gcc on Linux)") from exc
     lib.pe_qwen35_gdn.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 7 + [ctypes.c_float, ctypes.c_int, ctypes.c_void_p]
     lib.pe_qwen35_gdn.restype = ctypes.c_int
+    lib.pe_qwen35_add_norm.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 2 + [ctypes.c_float]
+    lib.pe_qwen35_add_norm.restype = ctypes.c_int
     if apple:
         lib.pe_pool.argtypes, lib.pe_pool.restype = [ctypes.c_int] * 3, ctypes.c_void_p
         lib.pe_pool_free.argtypes, lib.pe_pool_free.restype = [ctypes.c_void_p], None
@@ -48,7 +50,22 @@ class GatedDeltaNet:
         self.library, self._directory = library()
         self.threads = min(threads, 16)
         self.pool = WorkerPool(self.library, self.threads) if platform.system() == "Darwin" and threads > 1 else None
-        self.scratch = None
+        self.scratch = self.norm_buffer = None
+
+    def add_norm(self, x, branch, norm, *, owned=False):
+        """Update an owned residual and return normalized scratch (or owned output)."""
+        if owned:
+            out = torch.empty_like(x)
+        else:
+            if self.norm_buffer is None or self.norm_buffer.shape != x.shape:
+                self.norm_buffer = torch.empty_like(x)
+            out = self.norm_buffer
+        status = self.library.pe_qwen35_add_norm(
+            x.data_ptr(), branch.data_ptr(), norm.weight.data_ptr(), out.data_ptr(),
+            x.shape[0], x.shape[1], norm.eps)
+        if status:
+            raise PackedEncodersError(f"native Qwen3.5 add/RMSNorm failed: {status}")
+        return x, out
 
     def __call__(self, projection, layer, cu):
         g = layer.mixer
@@ -70,7 +87,7 @@ class GatedDeltaNet:
         if self.pool is not None:
             self.pool.close()
             self.pool = None
-        self.scratch = None
+        self.scratch = self.norm_buffer = None
 
 
 def reference_gdn(projection, layer, lengths):
