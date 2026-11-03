@@ -281,16 +281,26 @@ class PackedQwen35CPU(EpilogueSupport):
             rotated = torch.cat((-rot[..., r // 2:], rot[..., :r // 2]), -1)
             return torch.cat((rot * cos[:, None] + rotated * sin[:, None], t[..., r:]), -1)
         q, k = rope(q), rope(k)
-        out, offset = [], 0
-        for length in lengths:
-            sl = slice(offset, offset + length)
-            qq, kk, vv = (t[sl].transpose(0, 1)[None] for t in (q, k, v))
+        if all(length == lengths[0] for length in lengths):
+            # Keep sequence boundaries in the batch dimension and launch SDPA once.
+            batch, length = len(lengths), lengths[0]
+            qq, kk, vv = (t.reshape(batch, length, heads, hd).transpose(1, 2)
+                          for t, heads in ((q, nq), (k, nk), (v, nk)))
             # Explicit KV expansion reaches PyTorch's optimized CPU SDPA path.
             kk, vv = (t.repeat_interleave(nq // nk, 1) for t in (kk, vv))
             y = F.scaled_dot_product_attention(qq, kk, vv, is_causal=self.causal, scale=a.scaling)
-            out.append(y[0].transpose(0, 1).reshape(length, nq * hd))
-            offset += length
-        context = torch.cat(out) * gate.reshape(n, nq * hd).sigmoid()
+            context = y.transpose(1, 2).reshape(n, nq * hd)
+        else:
+            out, offset = [], 0
+            for length in lengths:
+                sl = slice(offset, offset + length)
+                qq, kk, vv = (t[sl].transpose(0, 1)[None] for t in (q, k, v))
+                kk, vv = (t.repeat_interleave(nq // nk, 1) for t in (kk, vv))
+                y = F.scaled_dot_product_attention(qq, kk, vv, is_causal=self.causal, scale=a.scaling)
+                out.append(y[0].transpose(0, 1).reshape(length, nq * hd))
+                offset += length
+            context = torch.cat(out)
+        context = context * gate.reshape(n, nq * hd).sigmoid()
         return self._linear(context, layer.out)[:, :self.hidden]
 
     def _core(self, ids, lengths, positions):

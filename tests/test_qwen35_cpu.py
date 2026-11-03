@@ -38,6 +38,26 @@ def inputs(lengths=(7, 65)):
     return ids, mask
 
 
+@pytest.mark.parametrize("lengths", [(1, 1), (7, 7, 7), (7, 3)])
+@pytest.mark.parametrize("causal", [True, False])
+@torch.no_grad()
+def test_attention_batch_boundaries(model, lengths, causal):
+    model.config.is_causal = causal
+    ids, mask = inputs(lengths)
+    want = model(ids, attention_mask=mask).last_hidden_state[mask]
+    pe.pack(model, engine=pe.Qwen35CPU(threads=2), validate=False)
+    try:
+        got = model(ids, attention_mask=mask).last_hidden_state[mask]
+        torch.testing.assert_close(got, want, atol=1e-5, rtol=2e-5)
+        # Independent requests must agree with batching: neither attention nor
+        # recurrence may carry information across a sequence boundary.
+        separate = torch.cat([model(ids[i:i + 1, :n]).last_hidden_state[0]
+                              for i, n in enumerate(lengths)])
+        torch.testing.assert_close(got, separate, atol=1e-5, rtol=2e-5)
+    finally:
+        pe.unpack(model)
+
+
 @pytest.mark.parametrize("backend", ["auto", "native", "sdpa"])
 @torch.no_grad()
 def test_parity(model, backend):
@@ -205,13 +225,21 @@ def test_onnx_baseline(model, tmp_path, seq):
         torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.parametrize("head_dims", [(16, 15), (16, 16), (16, 32), (128, 128)])
 @torch.no_grad()
-def test_native_grouped_gdn_with_conv_bias_and_long_sequences(model):
+def test_native_grouped_gdn_with_conv_bias_and_long_sequences(model, head_dims):
     from packed_encoders.cpu.qwen35 import GatedDeltaNet, reference_gdn
     from types import SimpleNamespace
-    g = model.layers[0].linear_attn
-    g.conv1d.bias = torch.nn.Parameter(torch.linspace(-2, 2, g.conv_dim))
-    g.A_log.copy_(torch.tensor([-3., 0., 2., 4.]))
+    hk, hv = head_dims
+    kd, vd = 2 * hk, 4 * hv
+    conv_dim = 2 * kd + vd
+    norm_type = type(model.layers[0].linear_attn.norm)
+    g = SimpleNamespace(num_k_heads=2, num_v_heads=4, head_k_dim=hk, head_v_dim=hv,
+                        key_dim=kd, value_dim=vd, conv_kernel_size=4,
+                        conv1d=torch.nn.Conv1d(conv_dim, conv_dim, 4, groups=conv_dim),
+                        A_log=torch.tensor([-3., 0., 2., 4.]), dt_bias=torch.randn(4),
+                        norm=norm_type(hv, eps=1e-6))
+    g.conv1d.bias.copy_(torch.linspace(-2, 2, conv_dim))
     lengths = (1, 3, 65, 129)
     projection = torch.randn(sum(lengths), 2 * g.key_dim + 2 * g.value_dim + 2 * g.num_v_heads) * 2
     layer = SimpleNamespace(mixer=g)

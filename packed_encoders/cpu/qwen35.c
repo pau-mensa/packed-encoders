@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <string.h>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #ifdef __APPLE__
 #include "pool.h"
 #else
@@ -32,6 +35,60 @@ static float convolve(const QwenJob *j, int token, int begin, int channel) {
     return x * sigmoid(x);
 }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+// Each value channel is independent. Tile across values so delta and output stay
+// in registers while reducing over keys. Preserve the generic reduction order;
+// the build keeps FP contraction disabled for both paths.
+static void recurrence_neon(float *state, float *delta, float *output,
+                            const float *q, const float *k, int hk, int hv,
+                            float decay, float beta) {
+    for (int base = 0; base < hv; base += 16) {
+        float32x4_t dv0 = vld1q_f32(delta + base), ov0 = vdupq_n_f32(0.f);
+        float32x4_t dv1 = vld1q_f32(delta + base + 4), ov1 = vdupq_n_f32(0.f);
+        float32x4_t dv2 = vld1q_f32(delta + base + 8), ov2 = vdupq_n_f32(0.f);
+        float32x4_t dv3 = vld1q_f32(delta + base + 12), ov3 = vdupq_n_f32(0.f);
+        for (int d = 0; d < hk; ++d) {
+            float *s = state + (size_t)d * hv + base;
+            float32x4_t s0 = vmulq_n_f32(vld1q_f32(s), decay);
+            vst1q_f32(s, s0);
+            dv0 = vsubq_f32(dv0, vmulq_n_f32(s0, k[d]));
+            float32x4_t s1 = vmulq_n_f32(vld1q_f32(s + 4), decay);
+            vst1q_f32(s + 4, s1);
+            dv1 = vsubq_f32(dv1, vmulq_n_f32(s1, k[d]));
+            float32x4_t s2 = vmulq_n_f32(vld1q_f32(s + 8), decay);
+            vst1q_f32(s + 8, s2);
+            dv2 = vsubq_f32(dv2, vmulq_n_f32(s2, k[d]));
+            float32x4_t s3 = vmulq_n_f32(vld1q_f32(s + 12), decay);
+            vst1q_f32(s + 12, s3);
+            dv3 = vsubq_f32(dv3, vmulq_n_f32(s3, k[d]));
+        }
+        dv0 = vmulq_n_f32(dv0, beta);
+        dv1 = vmulq_n_f32(dv1, beta);
+        dv2 = vmulq_n_f32(dv2, beta);
+        dv3 = vmulq_n_f32(dv3, beta);
+        for (int d = 0; d < hk; ++d) {
+            float *s = state + (size_t)d * hv + base;
+            float32x4_t s0 = vaddq_f32(vld1q_f32(s), vmulq_n_f32(dv0, k[d]));
+            vst1q_f32(s, s0);
+            ov0 = vaddq_f32(ov0, vmulq_n_f32(s0, q[d]));
+            float32x4_t s1 = vaddq_f32(vld1q_f32(s + 4), vmulq_n_f32(dv1, k[d]));
+            vst1q_f32(s + 4, s1);
+            ov1 = vaddq_f32(ov1, vmulq_n_f32(s1, q[d]));
+            float32x4_t s2 = vaddq_f32(vld1q_f32(s + 8), vmulq_n_f32(dv2, k[d]));
+            vst1q_f32(s + 8, s2);
+            ov2 = vaddq_f32(ov2, vmulq_n_f32(s2, q[d]));
+            float32x4_t s3 = vaddq_f32(vld1q_f32(s + 12), vmulq_n_f32(dv3, k[d]));
+            vst1q_f32(s + 12, s3);
+            ov3 = vaddq_f32(ov3, vmulq_n_f32(s3, q[d]));
+        }
+        vst1q_f32(output + base, ov0);
+        vst1q_f32(output + base + 4, ov1);
+        vst1q_f32(output + base + 8, ov2);
+        vst1q_f32(output + base + 12, ov3);
+    }
+}
+#endif
+
 static void qwen_head(QwenJob *j, int task, float *scratch) {
     int row = task / j->nv, head = task % j->nv, kh = head / (j->nv / j->nk);
     int hk = j->hk, hv = j->hv, kd = j->nk * hk, vd = j->nv * hv;
@@ -56,15 +113,22 @@ static void qwen_head(QwenJob *j, int task, float *scratch) {
             delta[d] = convolve(j, token, begin, 2 * kd + head * hv + d);
             output[d] = 0.f;
         }
-        // The value dimension is contiguous: the compiler vectorizes these inner loops.
-        for (int d = 0; d < hk; ++d) {
-            float *s = state + (size_t)d * hv;
-            for (int v = 0; v < hv; ++v) { s[v] *= decay; delta[v] -= s[v] * k[d]; }
-        }
-        for (int v = 0; v < hv; ++v) delta[v] *= beta;
-        for (int d = 0; d < hk; ++d) {
-            float *s = state + (size_t)d * hv;
-            for (int v = 0; v < hv; ++v) { s[v] += k[d] * delta[v]; output[v] += s[v] * q[d]; }
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        if (hv % 16 == 0) {
+            recurrence_neon(state, delta, output, q, k, hk, hv, decay, beta);
+        } else
+#endif
+        {
+            // The value dimension is contiguous: the compiler vectorizes these inner loops.
+            for (int d = 0; d < hk; ++d) {
+                float *s = state + (size_t)d * hv;
+                for (int v = 0; v < hv; ++v) { s[v] *= decay; delta[v] -= s[v] * k[d]; }
+            }
+            for (int v = 0; v < hv; ++v) delta[v] *= beta;
+            for (int d = 0; d < hk; ++d) {
+                float *s = state + (size_t)d * hv;
+                for (int v = 0; v < hv; ++v) { s[v] += k[d] * delta[v]; output[v] += s[v] * q[d]; }
+            }
         }
         float ss = 0.f;
         for (int v = 0; v < hv; ++v) ss += output[v] * output[v];
