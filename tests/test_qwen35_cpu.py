@@ -82,19 +82,21 @@ def test_qk_norm_rope_fallbacks(model, monkeypatch):
     try:
         want = engine._qk_rope(p, attention, cos.contiguous(), sin.contiguous())
         want = tuple(t.clone() for t in want)
+        # Large packed batches use the same native path as small ones.
+        large = p[:1].expand(129, -1).contiguous()
+        large_cos = cos[:1].expand(129, -1).contiguous()
+        large_sin = sin[:1].expand(129, -1).contiguous()
+        got = engine._qk_rope(large, attention, large_cos, large_sin)
+        assert got[0] is engine.native.q_buffer
+        assert got[1] is engine.native.k_buffer
+        for actual, expected in zip(got, want):
+            torch.testing.assert_close(actual, expected[:1].expand_as(actual), atol=3e-6, rtol=3e-6)
         def unexpected(*args, **kwargs):
             raise AssertionError("unsupported input reached fused Q/K norm/RoPE")
         monkeypatch.setattr(engine.native, "qk_rope", unexpected)
         got = engine._qk_rope(p, attention, cos, sin)
         for actual, expected in zip(got, want):
             torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-6)
-        # Large packed batches retain the eager path even with contiguous tables.
-        large = p[:1].expand(129, -1).contiguous()
-        large_cos = cos[:1].expand(129, -1).contiguous()
-        large_sin = sin[:1].expand(129, -1).contiguous()
-        got = engine._qk_rope(large, attention, large_cos, large_sin)
-        for actual, expected in zip(got, want):
-            torch.testing.assert_close(actual, expected[:1].expand_as(actual), atol=3e-6, rtol=3e-6)
         calls = []
         original = attention.q_norm.forward
         def custom(x):

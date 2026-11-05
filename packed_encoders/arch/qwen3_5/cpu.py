@@ -269,9 +269,7 @@ class PackedQwen35CPU(EpilogueSupport):
 
     def _qk_rope(self, p, attention, cos, sin):
         nq, nk, hd = self.cfg.num_attention_heads, self.cfg.num_key_value_heads, attention.head_dim
-        # M4 full-model probes favor fusion at 32/128 packed tokens, but regress
-        # at 256 despite a faster isolated kernel. Keep larger batches on Torch.
-        if (p.shape[0] <= 128 and self.native is not None
+        if (self.native is not None
                 and p.is_contiguous() and cos.is_contiguous() and sin.is_contiguous()
                 and all(type(norm) is self._rms_norm_type and "forward" not in norm.__dict__
                         for norm in (attention.q_norm, attention.k_norm))):
