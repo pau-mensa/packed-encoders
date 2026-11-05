@@ -153,13 +153,41 @@ int pe_qwen35_qk_rope(const float *p, const float *wq, const float *wk,
     return 0;
 }
 
-static float convolve(const QwenJob *j, int token, int begin, int channel) {
-    float x = j->bias ? j->bias[channel] : 0.f;
-    for (int tap = 0; tap < j->width; ++tap) {
-        int src = token + tap - j->width + 1;
-        if (src >= begin) x += j->proj[(size_t)src * j->stride + channel] * j->conv[channel * j->width + tap];
+static void convolve_channels(const QwenJob *j, int token, int begin, int channel,
+                               int count, float *out, float *temp) {
+    int d = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    if (j->width == 4) {
+        for (; d + 4 <= count; d += 4) {
+            float32x4_t x = j->bias ? vld1q_f32(j->bias + channel + d) : vdupq_n_f32(0.f);
+            // Deinterleave the four taps to process adjacent channels together.
+            float32x4x4_t w = vld4q_f32(j->conv + (size_t)(channel + d) * 4);
+            for (int tap = 0; tap < 4; ++tap) {
+                int src = token + tap - 3;
+                if (src >= begin)
+                    x = vaddq_f32(x, vmulq_f32(vld1q_f32(j->proj + (size_t)src * j->stride + channel + d), w.val[tap]));
+            }
+            vst1q_f32(out + d, x);
+        }
     }
-    return x * sigmoid(x);
+#endif
+    for (; d < count; ++d) {
+        float x = j->bias ? j->bias[channel + d] : 0.f;
+        for (int tap = 0; tap < j->width; ++tap) {
+            int src = token + tap - j->width + 1;
+            if (src >= begin)
+                x += j->proj[(size_t)src * j->stride + channel + d] * j->conv[(size_t)(channel + d) * j->width + tap];
+        }
+        out[d] = x;
+    }
+#ifdef __APPLE__
+    for (d = 0; d < count; ++d) temp[d] = -out[d];
+    vvexpf(temp, temp, &count);
+    for (d = 0; d < count; ++d) out[d] *= 1.f / (1.f + temp[d]);
+#else
+    (void)temp;
+    for (d = 0; d < count; ++d) out[d] *= sigmoid(out[d]);
+#endif
 }
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
@@ -220,15 +248,15 @@ static void qwen_head(QwenJob *j, int task, float *scratch) {
     int row = task / j->nv, head = task % j->nv, kh = head / (j->nv / j->nk);
     int hk = j->hk, hv = j->hv, kd = j->nk * hk, vd = j->nv * hv;
     float *state = scratch, *q = state + (size_t)hk * hv, *k = q + hk;
-    float *delta = k + hk, *output = delta + hv;
+    float *delta = k + hk, *output = delta + hv, *temp = output + hv;
     memset(state, 0, (size_t)hk * hv * sizeof(float));
     float a = expf(j->alog[head]), scale = 1.f / sqrtf((float)hk);
     int begin = j->cu[row], end = j->cu[row + 1];
     for (int token = begin; token < end; ++token) {
         float qs = 1e-6f, ks = 1e-6f;
+        convolve_channels(j, token, begin, kh * hk, hk, q, temp);
+        convolve_channels(j, token, begin, kd + kh * hk, hk, k, temp);
         for (int d = 0; d < hk; ++d) {
-            q[d] = convolve(j, token, begin, kh * hk + d);
-            k[d] = convolve(j, token, begin, kd + kh * hk + d);
             qs += q[d] * q[d]; ks += k[d] * k[d];
         }
         qs = scale / sqrtf(qs); ks = 1.f / sqrtf(ks);
@@ -236,10 +264,8 @@ static void qwen_head(QwenJob *j, int task, float *scratch) {
         const float *p = j->proj + (size_t)token * j->stride;
         float beta = sigmoid(p[2 * kd + 2 * vd + head]);
         float decay = expf(-a * softplus(p[2 * kd + 2 * vd + j->nv + head] + j->dt[head]));
-        for (int d = 0; d < hv; ++d) {
-            delta[d] = convolve(j, token, begin, 2 * kd + head * hv + d);
-            output[d] = 0.f;
-        }
+        convolve_channels(j, token, begin, 2 * kd + head * hv, hv, delta, temp);
+        memset(output, 0, (size_t)hv * sizeof(float));
 #if defined(__aarch64__) && defined(__ARM_NEON)
         if (hv % 16 == 0) {
             recurrence_neon(state, delta, output, q, k, hk, hv, decay, beta);
@@ -262,13 +288,19 @@ static void qwen_head(QwenJob *j, int task, float *scratch) {
         float inv = 1.f / sqrtf(ss / hv + j->eps);
         float *dst = j->out + ((size_t)token * j->nv + head) * hv;
         const float *z = p + 2 * kd + vd + head * hv;
+#ifdef __APPLE__
+        for (int v = 0; v < hv; ++v) temp[v] = -z[v];
+        vvexpf(temp, temp, &hv);
+        for (int v = 0; v < hv; ++v) dst[v] = output[v] * inv * j->norm[v] * z[v] * (1.f / (1.f + temp[v]));
+#else
         for (int v = 0; v < hv; ++v) dst[v] = output[v] * inv * j->norm[v] * z[v] * sigmoid(z[v]);
+#endif
     }
 }
 
 static void qwen_worker(void *opaque, size_t worker) {
     QwenJob *j = opaque;
-    size_t stride = (size_t)j->hk * j->hv + 2 * j->hk + 2 * j->hv;
+    size_t stride = (size_t)j->hk * j->hv + 2 * j->hk + 2 * j->hv + (j->hk > j->hv ? j->hk : j->hv);
     int task;
     while ((task = atomic_fetch_add_explicit(&j->next, 1, memory_order_relaxed)) < j->rows * j->nv)
         qwen_head(j, task, j->scratch + worker * stride);

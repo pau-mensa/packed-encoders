@@ -370,9 +370,10 @@ def test_onnx_baseline(model, tmp_path, seq):
         torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
 
 
-@pytest.mark.parametrize("head_dims", [(16, 15), (16, 16), (16, 32), (128, 128)])
+@pytest.mark.parametrize("head_dims", [(7, 9), (17, 7), (16, 15), (16, 16), (16, 32), (128, 128)])
+@pytest.mark.parametrize("conv_width", [3, 4])
 @torch.no_grad()
-def test_native_grouped_gdn_with_conv_bias_and_long_sequences(model, head_dims):
+def test_native_grouped_gdn_with_conv_bias_and_long_sequences(model, head_dims, conv_width):
     from packed_encoders.cpu.qwen35 import GatedDeltaNet, reference_gdn
     from types import SimpleNamespace
     hk, hv = head_dims
@@ -380,8 +381,8 @@ def test_native_grouped_gdn_with_conv_bias_and_long_sequences(model, head_dims):
     conv_dim = 2 * kd + vd
     norm_type = type(model.layers[0].linear_attn.norm)
     g = SimpleNamespace(num_k_heads=2, num_v_heads=4, head_k_dim=hk, head_v_dim=hv,
-                        key_dim=kd, value_dim=vd, conv_kernel_size=4,
-                        conv1d=torch.nn.Conv1d(conv_dim, conv_dim, 4, groups=conv_dim),
+                        key_dim=kd, value_dim=vd, conv_kernel_size=conv_width,
+                        conv1d=torch.nn.Conv1d(conv_dim, conv_dim, conv_width, groups=conv_dim),
                         A_log=torch.tensor([-3., 0., 2., 4.]), dt_bias=torch.randn(4),
                         norm=norm_type(hv, eps=1e-6))
     g.conv1d.bias.copy_(torch.linspace(-2, 2, conv_dim))

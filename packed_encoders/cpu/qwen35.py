@@ -102,7 +102,7 @@ class GatedDeltaNet:
     def __call__(self, projection, layer, cu):
         g = layer.mixer
         nk, nv, hk, hv = g.num_k_heads, g.num_v_heads, g.head_k_dim, g.head_v_dim
-        needed = self.threads * (hk * hv + 2 * hk + 2 * hv)
+        needed = self.threads * (hk * hv + 2 * hk + 2 * hv + max(hk, hv))
         if self.scratch is None or self.scratch.numel() < needed:
             self.scratch = torch.empty(needed, dtype=torch.float32)
         out = torch.empty(projection.shape[0], nv * hv, dtype=torch.float32)
