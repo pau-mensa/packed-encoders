@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import copy
+from itertools import groupby
 from types import SimpleNamespace
 import threading
 import warnings
@@ -292,25 +293,20 @@ class PackedQwen35CPU(EpilogueSupport):
         gate = p[:, :qw].reshape(n, nq, 2 * hd)[..., hd:]
         v = p[:, qw + kw:qw + 2 * kw].reshape(n, nk, hd)
         q, k = self._qk_rope(p, a, cos, sin)
-        if all(length == lengths[0] for length in lengths):
-            # Keep sequence boundaries in the batch dimension and launch SDPA once.
-            batch, length = len(lengths), lengths[0]
-            qq, kk, vv = (t.reshape(batch, length, heads, hd).transpose(1, 2)
+        out, offset = [], 0
+        # Batch contiguous runs of equal lengths without reordering packed tokens.
+        for length, run in groupby(lengths):
+            batch = sum(1 for _ in run)
+            count = batch * length
+            sl = slice(offset, offset + count)
+            qq, kk, vv = (t[sl].reshape(batch, length, heads, hd).transpose(1, 2)
                           for t, heads in ((q, nq), (k, nk), (v, nk)))
             # Explicit KV expansion reaches PyTorch's optimized CPU SDPA path.
             kk, vv = (t.repeat_interleave(nq // nk, 1) for t in (kk, vv))
             y = F.scaled_dot_product_attention(qq, kk, vv, is_causal=self.causal, scale=a.scaling)
-            context = y.transpose(1, 2).reshape(n, nq * hd)
-        else:
-            out, offset = [], 0
-            for length in lengths:
-                sl = slice(offset, offset + length)
-                qq, kk, vv = (t[sl].transpose(0, 1)[None] for t in (q, k, v))
-                kk, vv = (t.repeat_interleave(nq // nk, 1) for t in (kk, vv))
-                y = F.scaled_dot_product_attention(qq, kk, vv, is_causal=self.causal, scale=a.scaling)
-                out.append(y[0].transpose(0, 1).reshape(length, nq * hd))
-                offset += length
-            context = torch.cat(out)
+            out.append(y.transpose(1, 2).reshape(count, nq * hd))
+            offset += count
+        context = out[0] if len(out) == 1 else torch.cat(out)
         context = context * gate.reshape(n, nq * hd).sigmoid()
         return self._linear(context, layer.out)[:, :self.hidden]
 

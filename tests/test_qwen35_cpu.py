@@ -183,7 +183,7 @@ def test_add_rmsnorm_fallbacks(model, monkeypatch):
         pe.unpack(model)
 
 
-@pytest.mark.parametrize("lengths", [(1, 1), (7, 7, 7), (7, 3)])
+@pytest.mark.parametrize("lengths", [(1, 1), (7, 7, 7), (7, 3), (3, 3, 5, 5, 3)])
 @pytest.mark.parametrize("causal", [True, False])
 @torch.no_grad()
 def test_attention_batch_boundaries(model, lengths, causal):
@@ -199,6 +199,25 @@ def test_attention_batch_boundaries(model, lengths, causal):
         separate = torch.cat([model(ids[i:i + 1, :n]).last_hidden_state[0]
                               for i, n in enumerate(lengths)])
         torch.testing.assert_close(got, separate, atol=1e-5, rtol=2e-5)
+    finally:
+        pe.unpack(model)
+
+
+@torch.no_grad()
+def test_attention_groups_equal_length_runs(model, monkeypatch):
+    import torch.nn.functional as F
+    ids, mask = inputs((3, 3, 5, 5, 3))
+    want = model(ids, attention_mask=mask).last_hidden_state[mask]
+    pe.pack(model, engine=pe.Qwen35CPU(threads=2), validate=False)
+    calls, original = [], F.scaled_dot_product_attention
+    def record(q, k, v, **kwargs):
+        calls.append((q.shape[0], q.shape[2]))
+        return original(q, k, v, **kwargs)
+    monkeypatch.setattr(F, "scaled_dot_product_attention", record)
+    try:
+        got = model(ids, attention_mask=mask).last_hidden_state[mask]
+        torch.testing.assert_close(got, want, atol=1e-5, rtol=2e-5)
+        assert calls == [(2, 3), (2, 5), (1, 3)]
     finally:
         pe.unpack(model)
 
