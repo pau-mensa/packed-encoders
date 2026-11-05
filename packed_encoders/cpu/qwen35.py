@@ -20,7 +20,7 @@ def library():
     if apple:
         name = "qwen35.dylib"
         command = ["xcrun", "clang", "-O3", "-ffp-contract=off", "-dynamiclib", "-Wall", "-Wextra", "-Werror",
-                   str(here / "qwen35.c"), str(here / "pool.c")]
+                   str(here / "qwen35.c"), str(here / "pool.c"), "-framework", "Accelerate"]
     else:
         from packed_encoders.cpu.attention import _openmp_runtime
         runtime = _openmp_runtime()

@@ -9,6 +9,7 @@
 #include <arm_neon.h>
 #endif
 #ifdef __APPLE__
+#include <vecLib/vForce.h>
 #include "pool.h"
 #else
 #include <omp.h>
@@ -41,8 +42,16 @@ static void swiglu_worker(void *opaque, size_t worker) {
     while ((row = atomic_fetch_add_explicit(&j->next, 1, memory_order_relaxed)) < j->rows) {
         const float *gate = j->in + (size_t)row * j->stride, *up = gate + j->width;
         float *out = j->out + (size_t)row * j->width;
+#ifdef __APPLE__
+        // Reuse the destination for vector exp; inputs may include row padding.
+        for (int d = 0; d < j->width; ++d) out[d] = -gate[d];
+        vvexpf(out, out, &j->width);
+        for (int d = 0; d < j->width; ++d)
+            out[d] = (gate[d] / (1.f + out[d])) * up[d];
+#else
         for (int d = 0; d < j->width; ++d)
             out[d] = (gate[d] / (1.f + expf(-gate[d]))) * up[d];
+#endif
     }
 }
 
