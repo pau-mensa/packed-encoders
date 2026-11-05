@@ -426,24 +426,29 @@ class PackedQwen35CPU(EpilogueSupport):
             if input_ids.ndim != 2:
                 raise PackedEncodersError("padded input_ids must have shape [batch, sequence]")
             b, s = input_ids.shape
+            col = torch.arange(s)
             if attention_mask is None:
-                mask = torch.ones_like(input_ids, dtype=torch.bool)
+                lengths, dense = (s,) * b, True
             else:
                 if (attention_mask.device.type != "cpu" or attention_mask.shape != input_ids.shape
                         or not bool(((attention_mask == 0) | (attention_mask == 1)).all())):
                     return self.original_forward(input_ids, attention_mask, **kwargs)
                 mask = attention_mask.bool()
-            counts = mask.sum(1)
-            col = torch.arange(s)
-            right = (mask == (col < counts[:, None])).all(1)
-            # Left padding reaches GDN's convolution state even when projected inputs are zero
-            # (a biased convolution can produce nonzero states), so keep HF for left padding.
-            if not bool((counts > 0).all()) or not bool(right.all()):
-                return self.original_forward(input_ids, attention_mask, **kwargs)
-            lengths = tuple(counts.tolist())
-            hidden = self._packed(input_ids[mask], lengths, col.expand(b, s)[mask])
-            out = hidden.new_zeros(b, s, self.hidden)
-            out[mask] = hidden
+                counts = mask.sum(1)
+                right = (mask == (col < counts[:, None])).all(1)
+                # Left padding reaches GDN's convolution state even when projected inputs are zero
+                # (a biased convolution can produce nonzero states), so keep HF for left padding.
+                if not bool((counts > 0).all()) or not bool(right.all()):
+                    return self.original_forward(input_ids, attention_mask, **kwargs)
+                lengths = tuple(counts.tolist())
+                dense = all(n == s for n in lengths)
+            if dense:
+                hidden = self._packed(input_ids.reshape(-1), lengths, col.expand(b, s).reshape(-1))
+                out = hidden.reshape(b, s, self.hidden)
+            else:
+                hidden = self._packed(input_ids[mask], lengths, col.expand(b, s)[mask])
+                out = hidden.new_zeros(b, s, self.hidden)
+                out[mask] = hidden
             return_dict = kwargs.get("return_dict")
             if return_dict is None:
                 return_dict = getattr(self.binding.patch_target.config, "return_dict", True)

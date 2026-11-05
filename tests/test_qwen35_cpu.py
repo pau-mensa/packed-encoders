@@ -229,6 +229,26 @@ def test_parity(model, backend):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("mask_dtype", [None, torch.bool, torch.int64, torch.float32])
+@pytest.mark.parametrize("max_tokens", [7, 32])
+def test_dense_inputs_and_output_ownership(model, mask_dtype, max_tokens):
+    # Reshape must also handle callers' noncontiguous IDs, including microbatches.
+    ids = torch.arange(42).reshape(3, 14)[:, ::2]
+    mask = None if mask_dtype is None else torch.ones_like(ids, dtype=mask_dtype)
+    want = model(ids, attention_mask=mask).last_hidden_state
+    pe.pack(model, engine=pe.Qwen35CPU(threads=2, max_tokens=max_tokens), validate=False)
+    try:
+        got = model(ids, attention_mask=mask).last_hidden_state
+        torch.testing.assert_close(got, want, atol=1e-5, rtol=2e-5)
+        saved = got.clone()
+        model(ids + 1, attention_mask=mask)
+        torch.testing.assert_close(got, saved, atol=0, rtol=0)
+        torch.testing.assert_close(model(ids, attention_mask=mask, return_dict=False)[0], got, atol=0, rtol=0)
+    finally:
+        pe.unpack(model)
+
+
+@torch.no_grad()
 def test_default_selection_microbatches_and_positions(model):
     ids, mask = inputs((5, 3, 9))
     want = model(ids, attention_mask=mask).last_hidden_state
