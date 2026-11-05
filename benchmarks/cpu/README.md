@@ -1,5 +1,8 @@
 # ModernBERT CPU benchmarks
 
+Qwen3.5 has a separate [CPU engine and ONNX comparison](../../docs/qwen35-cpu.md):
+run `qwen35_bench.py` for FP32/INT8 engine and ONNX baselines on identical inputs.
+
 Run these commands from the repository root. The scripts compare
 `answerdotai/ModernBERT-base` on CPU using identical inputs for HF SDPA, the packed
 FP32/int8 engine, and ONNX Runtime FP32/MatMulNBits W8A8. Model downloads are

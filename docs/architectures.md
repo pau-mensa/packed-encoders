@@ -18,6 +18,11 @@ hidden = packed.forward_packed(pe.PackedBatch(ids, cu_seqlens, max_seqlen, posit
 pe.unpack(model)
 ```
 
+FP32 Qwen3.5 backbones on CPU select the [Qwen3.5 CPU engine](qwen35-cpu.md)
+through the curated Qwen architecture. `pe.Qwen35CPU(threads=...)` selects it
+explicitly; `precision="int8"` prepares SME2/VNNI projections. CPU and CUDA use
+the same lifecycle API with separate execution implementations.
+
 `pack` and `unpack` return the original target, including when it is a wrapper.
 Existing direct `packed_encoders.forward.packed_forward` callers remain supported.
 

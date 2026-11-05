@@ -70,14 +70,16 @@ def pack(
       A100, L40S, H200, and B200. Uncalibrated cards prefer Flash. SDPA is only the
       final no-kernel fallback.
 
-    `precision` (CPU ModernBERT engine only) selects the projection arithmetic:
+    `precision` (CPU ModernBERT and Qwen3.5 engines) selects the projection arithmetic:
 
     - **`"fp32"` (default)** — exact FP32, validated against the HF forward.
     - `"int8"` — int8 weights and activations on Apple CPUs with SME2 (M4 or later)
       or Linux x86-64 CPUs with AVX512-VNNI: faster, approximate. Packing calibrates
       on random tokens (no data needed). On other CPUs it warns and stays FP32
       (`state.precision` reports which runs). Other
-      engines reject the option; changing it requires unpacking first.
+      engines reject the option; changing it requires unpacking first. Qwen3.5
+      raises when INT8 hardware/compiler support is unavailable, and uses a
+      per-channel rotated weight quantizer without ModernBERT's GPTQ calibration.
 
     `validate` runs the hard gate during pack.
 
