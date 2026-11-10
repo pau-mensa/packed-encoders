@@ -38,6 +38,24 @@ def inputs(lengths=(7, 65)):
     return ids, mask
 
 
+@torch.no_grad()
+def test_local_topk_benchmark_loader(model, tmp_path):
+    import json
+    from safetensors.torch import save_file
+    from benchmarks.cpu.qwen35_bench import load_model
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "topk_embed", "text_config": model.config.to_dict()}))
+    weights = {"model.language_model." + key: value for key, value in model.state_dict().items()}
+    weights["head.weight"] = torch.randn(11, model.config.hidden_size)
+    save_file(weights, tmp_path / "model.safetensors")
+    loaded = load_model(str(tmp_path))
+    assert not loaded.training
+    assert all(p.dtype == torch.float32 and p.device.type == "cpu" for p in loaded.parameters())
+    assert all(b.device.type == "cpu" for b in loaded.buffers())
+    ids, mask = inputs()
+    torch.testing.assert_close(loaded(ids, attention_mask=mask).last_hidden_state,
+                               model(ids, attention_mask=mask).last_hidden_state, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("hd,rot", [(7, 4), (16, 16), (256, 64)])
 @torch.no_grad()
 def test_native_qk_norm_rope(model, hd, rot):
@@ -223,15 +241,19 @@ def test_attention_groups_equal_length_runs(model, monkeypatch):
 
 
 @pytest.mark.parametrize("backend", ["auto", "native", "sdpa"])
+@pytest.mark.parametrize("prepack_weights", [False, True])
+@pytest.mark.parametrize("threads", [1, 2])
 @torch.no_grad()
-def test_parity(model, backend):
+def test_parity(model, backend, prepack_weights, threads):
     ids, mask = inputs()
     want = model(ids, attention_mask=mask).last_hidden_state
     before = {name: (p.data_ptr(), p.clone()) for name, p in model.named_parameters()}
-    threads = torch.get_num_threads()
-    pe.pack(model, engine=pe.Qwen35CPU(threads=2), attention_backend=backend)
+    original_threads = torch.get_num_threads()
+    pe.pack(model, engine=pe.Qwen35CPU(threads=threads, prepack_weights=prepack_weights), attention_backend=backend)
     engine = pe.get_engine(model)
-    assert engine.precision == "fp32" and torch.get_num_threads() == threads
+    assert engine.precision == "fp32" and torch.get_num_threads() == original_threads
+    if not prepack_weights:
+        assert engine.state.projection_backend == "torch"
     got = model(ids, attention_mask=mask).last_hidden_state
     torch.testing.assert_close(got[mask], want[mask], atol=1e-5, rtol=2e-5)
     assert not got[~mask].any()
@@ -319,7 +341,7 @@ def test_pack_inside_inference_mode_keeps_fp32_updates_live(model):
     ids, mask = inputs((5, 3))
     original = model.forward
     with torch.inference_mode():
-        pe.pack(model)
+        pe.pack(model, engine=pe.Qwen35CPU(threads=1))
         model(ids, attention_mask=mask)
     with torch.no_grad():
         model.layers[0].mlp.gate_proj.weight.mul_(.9)
@@ -413,6 +435,7 @@ def test_onnx_baseline(model, tmp_path, seq):
 @pytest.mark.parametrize("conv_width", [3, 4])
 @torch.no_grad()
 def test_native_grouped_gdn_with_conv_bias_and_long_sequences(model, head_dims, conv_width):
+    import copy
     from packed_encoders.cpu.qwen35 import GatedDeltaNet, reference_gdn
     from types import SimpleNamespace
     hk, hv = head_dims
@@ -429,12 +452,79 @@ def test_native_grouped_gdn_with_conv_bias_and_long_sequences(model, head_dims, 
     projection = torch.randn(sum(lengths), 2 * g.key_dim + 2 * g.value_dim + 2 * g.num_v_heads) * 2
     layer = SimpleNamespace(mixer=g)
     cu = torch.tensor([0, *lengths], dtype=torch.int32).cumsum(0, dtype=torch.int32)
-    want = reference_gdn(projection, layer, lengths)
+    # Cancellation in convolution can put two FP32 implementations on opposite
+    # sides of the true result. Compare against a float64 recurrence rather
+    # than spending the entire error budget on their difference (seen on Zen 5).
+    g64 = copy.deepcopy(g)
+    g64.conv1d.double()
+    g64.norm.double()
+    g64.A_log, g64.dt_bias = g64.A_log.double(), g64.dt_bias.double()
+    want = reference_gdn(projection.double(), SimpleNamespace(mixer=g64), lengths).float()
     native = GatedDeltaNet(3)
     try:
         torch.testing.assert_close(native(projection, layer, cu), want, atol=3e-5, rtol=3e-5)
     finally:
         native.close()
+
+
+@pytest.mark.parametrize("target", ["generic", "avx2"])
+@torch.no_grad()
+def test_x86_recurrence_preserves_generic_results(model, target):
+    import ctypes
+    import platform
+    from pathlib import Path
+    from types import SimpleNamespace
+    from packed_encoders.cpu.attention import _openmp_runtime
+    from packed_encoders.cpu.build import shared_library
+    from packed_encoders.cpu.qwen35 import GatedDeltaNet
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        pytest.skip("Linux x86 build")
+    if target == "avx2" and torch.backends.cpu.get_cpu_capability() not in ("AVX2", "AVX512"):
+        pytest.skip("AVX2 unavailable")
+    runtime = _openmp_runtime()
+    source = Path(__file__).resolve().parents[1] / "packed_encoders/cpu/qwen35.c"
+    flags = ["-march=x86-64", *(["-mavx2"] if target == "avx2" else []), "-DPE_QWEN_SCALAR_EXP"]
+    path, lifetime = shared_library(f"qwen35_{target}.so", [[
+        "gcc", "-O3", *flags, "-ffp-contract=off", "-fno-math-errno", "-fno-trapping-math",
+        "-fPIC", "-fopenmp", "-shared", str(source), runtime, "-lm", "-o", "{build}/" + f"qwen35_{target}.so",
+    ]], runtime=runtime)
+    candidate = ctypes.CDLL(str(path))
+    native = GatedDeltaNet(3)
+    original = native.library
+    candidate.pe_qwen35_gdn.argtypes = original.pe_qwen35_gdn.argtypes
+    candidate.pe_qwen35_gdn.restype = ctypes.c_int
+    # Isolate recurrence/convolution ordering from libmvec's expf rounding.
+    # The float64-reference tests above cover the production vector expf path.
+    scalar_path, scalar_lifetime = shared_library("qwen35_scalar_native.so", [[
+        "gcc", "-O3", "-march=native", "-DPE_QWEN_SCALAR_EXP", "-ffp-contract=off",
+        "-fPIC", "-fopenmp", "-shared", str(source), runtime, "-lm",
+        "-o", "{build}/qwen35_scalar_native.so",
+    ]], runtime=runtime)
+    scalar_native = ctypes.CDLL(str(scalar_path))
+    scalar_native.pe_qwen35_gdn.argtypes = original.pe_qwen35_gdn.argtypes
+    scalar_native.pe_qwen35_gdn.restype = ctypes.c_int
+    try:
+        # Exercise SIMD widths, generic tails, grouped heads and sequence resets.
+        for hk, hv in ((7, 9), (16, 16), (16, 32), (128, 128)):
+            conv_dim = 4 * hk + 4 * hv
+            g = SimpleNamespace(num_k_heads=2, num_v_heads=4, head_k_dim=hk, head_v_dim=hv,
+                                conv_kernel_size=4,
+                                conv1d=torch.nn.Conv1d(conv_dim, conv_dim, 4, groups=conv_dim),
+                                A_log=torch.randn(4), dt_bias=torch.randn(4),
+                                norm=type(model.layers[0].linear_attn.norm)(hv, eps=1e-6))
+            layer = SimpleNamespace(mixer=g)
+            p = torch.randn(73, 4 * hk + 8 * hv + 8)
+            cu = torch.tensor([0, 1, 8, 73], dtype=torch.int32)
+            native.library = scalar_native
+            expected = native(p, layer, cu)
+            native.library = candidate
+            torch.testing.assert_close(native(p, layer, cu), expected, atol=0, rtol=0)
+    finally:
+        native.close()
+        if lifetime is not None:
+            lifetime.cleanup()
+        if scalar_lifetime is not None:
+            scalar_lifetime.cleanup()
 
 
 @torch.no_grad()
@@ -452,6 +542,26 @@ def test_compiler_fallback_and_failure_atomicity(model, monkeypatch):
     assert pe.get_engine(model).state.gdn_backend == "torch"
     pe.unpack(model)
     assert model.forward == original
+
+
+@torch.no_grad()
+def test_fp32_projection_compiler_fallback(model, monkeypatch):
+    import platform
+    import packed_encoders.cpu.attention as attention
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        pytest.skip("Linux x86 projection backend")
+    ids, mask = inputs((7, 3))
+    want = model(ids, attention_mask=mask).last_hidden_state[mask]
+    def unavailable():
+        raise PackedEncodersError("no x86 projection compiler")
+    monkeypatch.setattr(attention, "_x86_library", unavailable)
+    with pytest.warns(UserWarning, match="native x86 CPU kernels unavailable"):
+        pe.pack(model, engine=pe.Qwen35CPU(threads=2), validate=False)
+    try:
+        assert pe.get_engine(model).state.projection_backend == "torch"
+        torch.testing.assert_close(model(ids, attention_mask=mask).last_hidden_state[mask], want, atol=1e-5, rtol=2e-5)
+    finally:
+        pe.unpack(model)
 
 
 @torch.no_grad()

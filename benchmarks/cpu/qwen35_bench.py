@@ -13,17 +13,68 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import statistics
+import subprocess
 import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from qwen35_onnx import export, quantize, reuse_quantized_weights
+if __package__:
+    from .qwen35_onnx import export, quantize, reuse_quantized_weights
+else:
+    from qwen35_onnx import export, quantize, reuse_quantized_weights
+
+
+def load_model(path):
+    """Load HF text weights, or a local topk text backbone without its CUDA wrapper."""
+    from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
+    config = Path(path) / "config.json"
+    if config.is_file() and json.loads(config.read_text()).get("model_type") == "topk_embed":
+        from safetensors import safe_open
+        cfg = Qwen3_5TextConfig(**json.loads(config.read_text())["text_config"])
+        with torch.device("meta"):
+            model = Qwen3_5TextModel(cfg)
+        prefix = "model.language_model."
+        weights = {}
+        for shard in sorted(Path(path).glob("*.safetensors")):
+            with safe_open(shard, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key.startswith(prefix):
+                        weights[key[len(prefix):]] = f.get_tensor(key).float()
+        model.load_state_dict(weights, strict=True, assign=True)
+        # Rotary frequency buffers are nonpersistent and absent from the checkpoint.
+        model.rotary_emb = type(model.rotary_emb)(cfg, device="cpu")
+        model.set_attn_implementation("sdpa")
+    else:
+        model = Qwen3_5TextModel.from_pretrained(path, dtype=torch.float32, attn_implementation="sdpa")
+    model.config.use_cache = False
+    return model.eval()
+
+
+def provenance():
+    root = Path(__file__).resolve().parents[2]
+    paths = [*root.joinpath("packed_encoders/cpu").glob("*.[ch]"),
+             *root.joinpath("packed_encoders/cpu").glob("*.py"),
+             root / "packed_encoders/arch/qwen3_5/cpu.py", Path(__file__),
+             Path(__file__).with_name("qwen35_onnx.py")]
+    sources = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths)}
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+    cpu = Path("/proc/cpuinfo")
+    info = cpu.read_text().split("\n\n")[0] if cpu.exists() else ""
+    cpu_fields = {"vendor_id", "model name", "cpu family", "model", "stepping", "microcode", "cpu cores", "siblings", "flags"}
+    cpu_info = {key.strip(): value.strip() for line in info.splitlines() if ":" in line
+                for key, value in [line.split(":", 1)] if key.strip() in cpu_fields}
+    return {"commit": git("rev-parse", "HEAD"), "tracked_diff_sha256": hashlib.sha256(git("diff", "HEAD").encode()).hexdigest(),
+            "sources": sources, "cpu": cpu_info, "affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
+            "environment": {k: os.environ.get(k) for k in ("OMP_WAIT_POLICY", "OMP_PROC_BIND", "OMP_PLACES", "MKL_NUM_THREADS")}}
 
 
 def workloads(vocab):
@@ -82,20 +133,26 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--spin", default="1,0")
     ap.add_argument("--onnx-int8", default="int8_dynamic,int8_w8a8")
+    ap.add_argument("--engine-precision", default="fp32,int8", help="comma-separated fp32/int8; use fp32 for the initial baseline")
+    ap.add_argument("--no-prepack-weights", action="store_true", help="use PyTorch FP32 projections for ablations")
     ap.add_argument("--stage", choices=("all", "engine", "export", "onnx"), default="all")
     ap.add_argument("--time-hf", action="store_true", help="also time stock HF (always used as the accuracy reference)")
     ap.add_argument("--rowtrim", action="store_true", help="also measure the sum of independently warmed ONNX row medians")
     a = ap.parse_args()
     if a.threads <= 0 or a.trials <= 0 or a.warmup < 0:
         ap.error("threads/trials must be positive; warmup must be nonnegative")
+    precisions = a.engine_precision.split(",")
+    variants = tuple(filter(None, a.onnx_int8.split(",")))
+    if not precisions or set(precisions) - {"fp32", "int8"}:
+        ap.error("--engine-precision must contain fp32 and/or int8")
+    if set(variants) - {"int8_dynamic", "int8_w8a8"}:
+        ap.error("unknown --onnx-int8 variant")
     torch.set_num_threads(a.threads)
     torch.set_num_interop_threads(1)
     import packed_encoders as pe
     import transformers
     import onnxruntime as ort
-    from transformers import Qwen3_5TextModel
-    model = Qwen3_5TextModel.from_pretrained(a.model, dtype=torch.float32, attn_implementation="sdpa").eval()
-    model.config.use_cache = False
+    model = load_model(a.model)
     loads = workloads(model.config.vocab_size)
     unknown = set(a.only.split(",")) - loads.keys()
     if unknown:
@@ -115,11 +172,14 @@ def main():
     result = {"model": a.model, "threads": a.threads, "torch": torch.__version__, "transformers": transformers.__version__,
               "onnxruntime": ort.__version__, "platform": platform.platform(), "processor": platform.processor(),
               "warmup": a.warmup, "trials": a.trials, "rows": {},
+              "prepack_weights": not a.no_prepack_weights,
+              "provenance": provenance(), "causal": getattr(model.config, "is_causal", True),
               "workloads": {name: {"shape": list(ids.shape), "lengths": mask.sum(1).tolist()}
                             for name, (ids, mask) in loads.items()}}
     if out.exists():
         previous = json.loads(out.read_text())
-        if any(previous[k] != result[k] for k in ("model", "threads", "torch", "transformers", "onnxruntime")):
+        if any(previous.get(k) != result[k] for k in ("model", "threads", "torch", "transformers", "onnxruntime",
+                                                      "warmup", "trials", "workloads", "causal", "provenance", "prepack_weights")):
             raise ValueError("output belongs to another configuration; choose a new --out")
         result["rows"].update(previous["rows"])
     def record(key, stats):
@@ -145,15 +205,17 @@ def main():
             if a.time_hf and a.stage in ("all", "engine"):
                 record(f"hf_fp32|{name}", {**measure(fn, a.warmup, a.trials), **accuracy(refs[name], refs[name])})
         if a.stage in ("all", "engine"):
-            for precision in ("fp32", "int8"):
+            for precision in precisions:
                 start = time.perf_counter()
-                pe.pack(model, engine=pe.Qwen35CPU(threads=a.threads), precision=precision)
+                pe.pack(model, engine=pe.Qwen35CPU(threads=a.threads, prepack_weights=not a.no_prepack_weights), precision=precision)
+                backend = pe.get_engine(model).state.projection_backend
                 print(f"prepared engine {precision} in {time.perf_counter() - start:.2f}s", flush=True)
                 for name, (ids, mask) in loads.items():
                     fn = lambda: model(input_ids=ids, attention_mask=mask).last_hidden_state
                     metrics = accuracy(fn()[mask.bool()], refs[name])
                     gate(metrics, precision)
-                    record(f"engine_{precision}|{name}", {**measure(fn, a.warmup, a.trials), **metrics})
+                    record(f"engine_{precision}|{name}", {**measure(fn, a.warmup, a.trials), **metrics,
+                                                         "projection_backend": backend})
                 pe.unpack(model)
                 gc.collect()
         if a.stage in ("all", "export"):
@@ -171,7 +233,7 @@ def main():
                         print(f"export parity s{width} {name}: {metrics}", flush=True)
                 del sess
                 gc.collect()
-                for variant in a.onnx_int8.split(","):
+                for variant in variants:
                     dest = directory / f"{variant}_s{width}.onnx"
                     if not dest.exists():
                         quantize(path, dest, variant)
@@ -184,14 +246,14 @@ def main():
                         path = directory / f"fp32_s{length}.onnx"
                         if not path.exists():
                             export(model, directory, length)
-                        for variant in a.onnx_int8.split(","):
+                        for variant in variants:
                             dest = directory / f"{variant}_s{length}.onnx"
                             reuse_quantized_weights(directory / f"fp32_s{width}.onnx",
                                                     directory / f"{variant}_s{width}.onnx", path, dest)
     del model
     gc.collect()
     if a.stage in ("all", "onnx"):
-        for variant in ("fp32", *a.onnx_int8.split(",")):
+        for variant in ("fp32", *variants):
             for width in widths:
                 for spin in map(int, a.spin.split(",")):
                     sess = session(directory / f"{variant}_s{width}.onnx", a.threads, spin)
@@ -206,7 +268,7 @@ def main():
                     del sess
                     gc.collect()
         if a.rowtrim:
-            for variant in ("fp32", *a.onnx_int8.split(",")):
+            for variant in ("fp32", *variants):
                 for name, (ids, mask) in loads.items():
                     lengths = mask.sum(1).tolist()
                     if min(lengths) == ids.shape[1]:

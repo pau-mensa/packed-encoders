@@ -165,4 +165,67 @@ int pe_linear(const float *x, const float *w, const float *bias, float *y, int M
     return pe_linear_tile(x, w, bias, y, M, N, K, workers, K == 1152 ? 4 : 3, K == 1152 ? 6 : 8);
 }
 
+// Prepared weights [N/64, K, 64]. Vector lanes are output channels, so one
+// input broadcast updates 64 outputs without horizontal reductions. The six-row
+// tile keeps 24 accumulators live. K panels fit the 1 MiB Zen 5 L2; small L1
+// panels lost to repeatedly loading/storing partial outputs on Qwen's shapes.
+// Every output uses the same increasing-K FMA chain, including partial row tiles.
+static inline __attribute__((always_inline)) void packed_tile(
+        const float *x, const float *w, float *y, int K, int N, int count, int first, const int R) {
+    const __m512 zero = _mm512_setzero_ps();
+#define DECL(r) \
+    __m512 a##r##0=zero, a##r##1=zero, a##r##2=zero, a##r##3=zero; \
+    if (R > r && !first) { \
+        a##r##0 = _mm512_loadu_ps(y + (size_t)(r) * N); \
+        a##r##1 = _mm512_loadu_ps(y + (size_t)(r) * N + 16); \
+        a##r##2 = _mm512_loadu_ps(y + (size_t)(r) * N + 32); \
+        a##r##3 = _mm512_loadu_ps(y + (size_t)(r) * N + 48); }
+    DECL(0) DECL(1) DECL(2) DECL(3) DECL(4) DECL(5)
+    for (int k = 0; k < count; ++k) {
+        const float *b = w + (size_t)k * 64;
+        const __m512 w0 = _mm512_loadu_ps(b), w1 = _mm512_loadu_ps(b + 16);
+        const __m512 w2 = _mm512_loadu_ps(b + 32), w3 = _mm512_loadu_ps(b + 48);
+#define STEP(r) if (R > r) { \
+        const __m512 v = _mm512_set1_ps(x[(size_t)(r) * K + k]); \
+        a##r##0 = _mm512_fmadd_ps(v, w0, a##r##0); \
+        a##r##1 = _mm512_fmadd_ps(v, w1, a##r##1); \
+        a##r##2 = _mm512_fmadd_ps(v, w2, a##r##2); \
+        a##r##3 = _mm512_fmadd_ps(v, w3, a##r##3); }
+        STEP(0) STEP(1) STEP(2) STEP(3) STEP(4) STEP(5)
+    }
+#define STORE(r) if (R > r) { \
+    _mm512_storeu_ps(y + (size_t)(r) * N, a##r##0); \
+    _mm512_storeu_ps(y + (size_t)(r) * N + 16, a##r##1); \
+    _mm512_storeu_ps(y + (size_t)(r) * N + 32, a##r##2); \
+    _mm512_storeu_ps(y + (size_t)(r) * N + 48, a##r##3); }
+    STORE(0) STORE(1) STORE(2) STORE(3) STORE(4) STORE(5)
+#undef DECL
+#undef STEP
+#undef STORE
+}
+
+int pe_linear_packed(const float *x, const float *w, float *y,
+                     int M, int N, int K, int workers) {
+    if (!x || !w || !y || M <= 0 || N <= 0 || N % 64 || K <= 0 || workers <= 0) return 1;
+    #pragma omp parallel for num_threads(workers) if (workers > 1) schedule(static)
+    for (int nb = 0; nb < N / 64; ++nb) {
+        for (int kb = 0; kb < K; kb += 4096) {
+            const int count = K - kb < 4096 ? K - kb : 4096;
+            const float *b = w + ((size_t)nb * K + kb) * 64;
+            for (int m = 0; m < M; m += 6) {
+                const float *a = x + (size_t)m * K + kb;
+                float *c = y + (size_t)m * N + nb * 64;
+                int rows = M - m;
+                if (rows >= 6) packed_tile(a, b, c, K, N, count, kb == 0, 6);
+                else if (rows == 5) packed_tile(a, b, c, K, N, count, kb == 0, 5);
+                else if (rows == 4) packed_tile(a, b, c, K, N, count, kb == 0, 4);
+                else if (rows == 3) packed_tile(a, b, c, K, N, count, kb == 0, 3);
+                else if (rows == 2) packed_tile(a, b, c, K, N, count, kb == 0, 2);
+                else packed_tile(a, b, c, K, N, count, kb == 0, 1);
+            }
+        }
+    }
+    return 0;
+}
+
 #endif

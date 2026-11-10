@@ -27,7 +27,9 @@ def library():
         if runtime is None:
             raise PackedEncodersError("native Qwen3.5 needs gcc and PyTorch's OpenMP runtime")
         name = "qwen35.so"
-        command = ["gcc", "-O3", "-ffp-contract=off", "-fPIC", "-fopenmp", "-shared", "-Wall", "-Wextra", "-Werror",
+        command = ["gcc", "-O3", "-march=native", "-ffp-contract=off", "-fno-math-errno", "-fno-trapping-math",
+                   *(["-mprefer-vector-width=512"] if platform.machine() == "x86_64" else []),
+                   "-fPIC", "-fopenmp", "-shared", "-Wall", "-Wextra", "-Werror",
                    str(here / "qwen35.c"), runtime, f"-Wl,-rpath,{Path(runtime).parent}", "-lm"]
     try:
         path, directory = shared_library(name, [[*command, "-o", "{build}/" + name]], runtime=runtime)

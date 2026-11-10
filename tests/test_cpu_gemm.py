@@ -81,6 +81,63 @@ def attention():
     attention.close()
 
 
+@pytest.mark.parametrize('m,n,k', [(1, 64, 1), (5, 128, 17), (6, 64, 128),
+                                  (7, 128, 4095), (17, 64, 4097), (32, 128, 1024)])
+@torch.no_grad()
+def test_prepared_fp32_math_tails_and_row_independence(attention, m, n, k):
+    from packed_encoders.cpu.fp32_x86 import FP32Projections
+    rng = torch.Generator().manual_seed(523)
+    w, x = torch.randn(n, k, generator=rng), torch.randn(m, k, generator=rng)
+    prepared = FP32Projections([w])
+    fn = prepared.library.pe_linear_packed
+    packed = prepared.weights[id(w)][1]
+    reference = None
+    for workers in (1, 3):
+        out = torch.empty(m, n)
+        assert fn(x.data_ptr(), packed.data_ptr(), out.data_ptr(), m, n, k, workers) == 0
+        if reference is None:
+            reference = out.clone()
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+        one = torch.empty(1, n)
+        row = x[m // 2:m // 2 + 1]
+        assert fn(row.data_ptr(), packed.data_ptr(), one.data_ptr(), 1, n, k, workers) == 0
+        torch.testing.assert_close(one[0], reference[m // 2], atol=0, rtol=0)
+    expected = F.linear(x.double(), w.double())
+    assert (reference.double() - expected).norm() / expected.norm() < 2e-6
+    for mm, nn, kk, workers in ((0, n, k, 1), (m, n - 1, k, 1), (m, n, 0, 1), (m, n, k, 0)):
+        saved = out.clone()
+        assert fn(x.data_ptr(), packed.data_ptr(), out.data_ptr(), mm, nn, kk, workers) == 1
+        torch.testing.assert_close(out, saved, atol=0, rtol=0)
+    prepared.close()
+
+
+@torch.no_grad()
+def test_prepared_fp32_refresh_ownership_and_fallbacks(attention):
+    from packed_encoders.cpu.fp32_x86 import FP32Projections
+    w = torch.randn(128, 192)
+    before = w.clone()
+    with torch.inference_mode():
+        prepared = FP32Projections([w])
+        first = prepared.linear(torch.randn(17, 192), w)
+        saved = first.clone()
+    prepared.linear(torch.randn(17, 192), w)
+    # Output buffers are borrowed; an immediate same-shape call reuses storage.
+    assert not torch.equal(first, saved)
+    for m in (3, 17, 7):
+        w.mul_(.9)
+        x = torch.randn(m, 192)
+        got = prepared.linear(x, w)
+        expected = F.linear(x.double(), w.double())
+        assert (got.double() - expected).norm() / expected.norm() < 1e-6
+    assert prepared.packed_bytes == before.numel() * 4
+    assert prepared.linear(torch.randn(1, 192), w) is None
+    assert prepared.linear(torch.randn(3, 384)[:, ::2], w) is None
+    assert prepared.linear(torch.randn(3, 192).double(), w) is None
+    assert prepared.linear(torch.randn(3, 192), w.clone()) is None
+    prepared.close()
+    assert not prepared.weights and not prepared.outputs
+
+
 @torch.no_grad()
 def test_every_tile_is_bitwise_equal_across_rows_and_workers(attention):
     rng = torch.Generator().manual_seed(521)

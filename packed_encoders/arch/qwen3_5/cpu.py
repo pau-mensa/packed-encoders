@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import copy
 from itertools import groupby
+import platform
 from types import SimpleNamespace
 import threading
 import warnings
@@ -68,6 +69,8 @@ class Qwen35CPU:
     PyTorch/BLAS keeps the caller's process thread settings. ``max_tokens`` bounds
     packed microbatches without splitting a sequence. Native GatedDeltaNet runs on
     macOS and Linux; attention uses per-sequence SDPA with grouped query heads.
+    ``prepack_weights`` enables native FP32 projections (AVX-512 on Linux,
+    prepared SME weights on Apple); disabling it retains PyTorch projections.
 
     FP32 projection copies refresh on ordinary in-place updates. INT8 weights are
     prepared once; updates require unpack/repack. Parameter replacement, storage
@@ -155,7 +158,7 @@ class PackedQwen35CPU(EpilogueSupport):
         self.causal = (getattr(self.model, "document_causal", False) if self.topk else
                        getattr(binding, "causal", getattr(self.cfg, "is_causal", True)))
         self.hidden, self.max_position = self.cfg.hidden_size, self.cfg.max_position_embeddings
-        self.native = self.sme = self.int8 = None
+        self.native = self.sme = self.fp32 = self.packed_fp32 = self.int8 = None
         self.projections, self.layers = [], []
         if self.topk:
             head = binding.patch_target.head
@@ -223,9 +226,21 @@ class PackedQwen35CPU(EpilogueSupport):
                         self.sme.max_rows = min(self.sme.max_rows, 64)
                     except PackedEncodersError as exc:
                         warnings.warn(str(exc), stacklevel=3)
+                elif platform.system() == "Linux" and platform.machine() == "x86_64":
+                    from packed_encoders.cpu.attention import CPUAttention
+                    # Reuse ModernBERT's projection interface independently of its
+                    # attention shape envelope. AVX2 hosts keep F.linear.
+                    self.fp32 = CPUAttention("auto", self.cfg.head_dim, 0, min(self.threads, 16))
+                    if self.threads == 1 and self.fp32.native_linear:
+                        from packed_encoders.cpu.fp32_x86 import FP32Projections as X86Projections
+                        self.packed_fp32 = X86Projections(p.weight for p in self.projections)
             self.precision = "int8" if self.int8 else "fp32"
             self.state = SimpleNamespace(precision=self.precision, attention_backend="sdpa",
-                                         gdn_backend="native" if self.native else "torch", validation_report=None)
+                                         gdn_backend="native" if self.native else "torch",
+                                         projection_backend=("int8" if self.int8 else "sme" if self.sme else
+                                                             "avx512-packed" if self.packed_fp32 else
+                                                             "avx512" if self.fp32 and self.fp32.native_linear else "torch"),
+                                         validation_report=None)
         except BaseException:
             self.close(rollback=True)
             raise
@@ -265,6 +280,12 @@ class PackedQwen35CPU(EpilogueSupport):
         if self.int8 is not None:
             return self.int8.linear(x.contiguous(), p)
         p.refresh()
+        if self.packed_fp32 is not None:
+            out = self.packed_fp32.linear(x, p.weight)
+            if out is not None:
+                return out
+        if self.fp32 is not None:
+            return self.fp32.linear(x, p.weight)
         out = None if self.sme is None else self.sme.linear(x.contiguous(), p.weight, None, self.threads)
         return F.linear(x, p.weight) if out is None else out
 
@@ -543,10 +564,10 @@ class PackedQwen35CPU(EpilogueSupport):
             if self._closed:
                 return
             self._close_epilogues()
-            for resource in (self.int8, self.sme, self.native):
+            for resource in (self.int8, self.sme, self.fp32, self.packed_fp32, self.native):
                 if resource is not None:
                     resource.close()
-            self.int8 = self.sme = self.native = None
+            self.int8 = self.sme = self.fp32 = self.packed_fp32 = self.native = None
             self.layers.clear()
             self.projections.clear()
             self._closed = True
